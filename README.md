@@ -65,15 +65,87 @@ If those commands work, the bridge is ready for CLI use and MCP clients.
 
 ## Use With Codex Or Similar Tools
 
-The MCP adapter is the intended path for Codex-style clients:
+The MCP adapter is what lets Codex talk to Houdini. The connection has three
+pieces:
+
+1. Houdini runs the `Blib Bridge` shelf server.
+2. Codex starts `scripts\cli\blib_hou_mcp.py` as a local MCP server.
+3. That MCP server reads Houdini's current bridge session and exposes Houdini
+   tools to Codex.
+
+Start with Houdini already open and the shelf server running. Then check the MCP
+adapter from this repo:
 
 ```powershell
-python scripts\cli\blib_hou_mcp.py --print-config
 python scripts\cli\blib_hou_mcp.py --status
 ```
 
-Use the printed config in your MCP client. Once connected, the client can ask
-the bridge for scene context, inspect nodes, and use the bridge workflow tools.
+If `readiness.status` is `ready` or `degraded`, the MCP adapter can see the
+bridge.
+
+### Add It To Codex
+
+Codex uses TOML config, not the `mcpServers` JSON format used by some other MCP
+clients.
+
+Open your Codex config file:
+
+```text
+%UserProfile%\.codex\config.toml
+```
+
+To see the exact Python path and script path for your machine, run:
+
+```powershell
+python scripts\cli\blib_hou_mcp.py --print-config
+```
+
+That command prints JSON for generic MCP clients. For Codex, copy the printed
+`command` value and first `args` value into TOML like this:
+
+```toml
+[mcp_servers.blib-houdini-bridge]
+command = 'C:\Path\To\python.exe'
+args = ['C:\Path\To\houdini-mcp-cli\scripts\cli\blib_hou_mcp.py']
+```
+
+If `python` is already available on PATH, this shorter version is enough:
+
+```toml
+[mcp_servers.blib-houdini-bridge]
+command = 'python'
+args = ['C:\Path\To\houdini-mcp-cli\scripts\cli\blib_hou_mcp.py']
+```
+
+Then restart Codex, or start a new Codex session. In Codex, ask it to check the
+Houdini MCP connection:
+
+```text
+Use the blib-houdini-bridge MCP server to read houdini://adapter/status,
+then take a read-only scene snapshot of /obj.
+```
+
+If you use Codex CLI, you can also check whether Codex has loaded the server:
+
+```powershell
+codex mcp list
+```
+
+If the connection is working, Codex should see tools and resources with names
+such as:
+
+- `houdini://adapter/status`
+- `houdini://scene/current`
+- `houdini_scene_snapshot`
+- `houdini_node_info`
+- `houdini_edit_mode`
+
+Do not paste the JSON from `--print-config` directly into Codex. That command is
+still useful for MCP clients that expect JSON:
+
+```powershell
+python scripts\cli\blib_hou_mcp.py --print-config
+```
 
 For details about the MCP surface, see [docs/HOUDINI_MCP.md](docs/HOUDINI_MCP.md).
 
@@ -160,15 +232,82 @@ python scripts\cli\blib_hou_mcp.py --status
 
 ### 配合 Codex 或类似工具使用
 
-Codex 这类工具建议通过 MCP 适配器连接：
+MCP 适配器就是让 Codex 连接 Houdini 的那一层。整个链路是这样的：
+
+1. Houdini 里运行 `Blib Bridge` shelf server。
+2. Codex 在本地启动 `scripts\cli\blib_hou_mcp.py` 这个 MCP server。
+3. 这个 MCP server 读取当前 Houdini bridge session，然后把 Houdini 工具暴露给
+   Codex。
+
+先确认 Houdini 已经打开，并且 shelf 上的 `Bridge` 已经启动。然后在这个仓库里运行：
 
 ```powershell
-python scripts\cli\blib_hou_mcp.py --print-config
 python scripts\cli\blib_hou_mcp.py --status
 ```
 
-把打印出来的配置填到你的 MCP 客户端里。连接后，客户端就可以读取场景上下文、
-检查节点，并通过 bridge 的工作流工具执行受控操作。
+如果返回里的 `readiness.status` 是 `ready` 或 `degraded`，说明 MCP 适配器已经能
+看到 Houdini bridge。
+
+#### 添加到 Codex
+
+Codex 使用 TOML 配置，不是很多 MCP 客户端使用的 `mcpServers` JSON。
+
+打开 Codex 配置文件：
+
+```text
+%UserProfile%\.codex\config.toml
+```
+
+先运行下面的命令，拿到你本机真实的 Python 路径和 MCP 脚本路径：
+
+```powershell
+python scripts\cli\blib_hou_mcp.py --print-config
+```
+
+这个命令打印的是给通用 MCP 客户端用的 JSON。Codex 需要 TOML，所以把输出里的
+`command` 和第一个 `args` 值复制到下面的 TOML 配置里：
+
+```toml
+[mcp_servers.blib-houdini-bridge]
+command = 'C:\Path\To\python.exe'
+args = ['C:\Path\To\houdini-mcp-cli\scripts\cli\blib_hou_mcp.py']
+```
+
+如果你的终端里可以直接运行 `python`，也可以写短一点：
+
+```toml
+[mcp_servers.blib-houdini-bridge]
+command = 'python'
+args = ['C:\Path\To\houdini-mcp-cli\scripts\cli\blib_hou_mcp.py']
+```
+
+然后重启 Codex，或者开一个新的 Codex 会话。在 Codex 里可以这样问：
+
+```text
+Use the blib-houdini-bridge MCP server to read houdini://adapter/status,
+then take a read-only scene snapshot of /obj.
+```
+
+如果你用的是 Codex CLI，也可以用下面的命令确认 Codex 是否加载到了这个 server：
+
+```powershell
+codex mcp list
+```
+
+如果连接成功，Codex 应该能看到这些资源或工具：
+
+- `houdini://adapter/status`
+- `houdini://scene/current`
+- `houdini_scene_snapshot`
+- `houdini_node_info`
+- `houdini_edit_mode`
+
+不要把 `--print-config` 打印出来的 JSON 直接贴进 Codex。那个命令是给使用 JSON
+配置的 MCP 客户端准备的：
+
+```powershell
+python scripts\cli\blib_hou_mcp.py --print-config
+```
 
 MCP 接口细节见 [docs/HOUDINI_MCP.md](docs/HOUDINI_MCP.md)。
 

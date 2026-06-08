@@ -48,7 +48,9 @@ FORBIDDEN_RELEASE_DIRS = [
 
 REQUIRED_DOC_MARKERS = {
     "README.md": [
-        "tools\\acceptance_smoke.py",
+        "docs/BRIDGE_ONLY_RELEASE.md",
+        "python scripts\\cli\\blib_hou.py doctor",
+        "python scripts\\cli\\blib_hou_mcp.py --status",
         "tools\\clean_release_artifacts.py",
         "tools\\write_houdini_package.py",
         "python -m unittest tests.test_blib_hou_bridge tests.test_blib_hou_mcp",

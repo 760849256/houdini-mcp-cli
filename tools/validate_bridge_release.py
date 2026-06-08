@@ -48,15 +48,17 @@ FORBIDDEN_RELEASE_DIRS = [
 
 REQUIRED_DOC_MARKERS = {
     "README.md": [
+        "Codex, MCP clients, CLI scripts",
+        "connect to Houdini",
+        "Use With Codex Or Similar Tools",
+        "python tools\\write_houdini_package.py --output Blib_Houdini_Bridge.local.json",
         "docs/BRIDGE_ONLY_RELEASE.md",
         "python scripts\\cli\\blib_hou.py doctor",
+        "python scripts\\cli\\blib_hou.py scene-snapshot --path /obj",
         "python scripts\\cli\\blib_hou_mcp.py --status",
-        "tools\\clean_release_artifacts.py",
-        "tools\\write_houdini_package.py",
-        "python -m unittest tests.test_blib_hou_bridge tests.test_blib_hou_mcp",
-        "python tools\\validate_bridge_release.py",
-        "python tools\\validate_bridge_release.py --strict",
-        "python tools\\validate_bridge_release.py --public --strict",
+        "python scripts\\cli\\blib_hou_mcp.py --print-config",
+        "Safety Model",
+        "中文说明",
     ],
     "docs/BRIDGE_ONLY_RELEASE.md": [
         "acceptance_smoke.py",

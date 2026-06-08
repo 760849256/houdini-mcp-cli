@@ -1955,6 +1955,21 @@ class BridgeMCPAdapterTests(unittest.TestCase):
         self.assertEqual(server["args"][-2:], ["--session", session_path])
         self.assertNotIn("token", output.getvalue().lower())
 
+    def test_cli_print_codex_config_outputs_toml(self):
+        session_path = "C:/Temp/blib_hou_bridge/custom-session.json"
+        with _capture_stdout() as output:
+            result = main(["--session", session_path, "--print-codex-config"])
+
+        text = output.getvalue()
+        self.assertEqual(result, 0)
+        self.assertIn("[mcp_servers.blib-houdini-bridge]", text)
+        self.assertIn("command =", text)
+        self.assertIn("args = [", text)
+        self.assertIn("blib_hou_mcp.py", text)
+        self.assertIn("--session", text)
+        self.assertIn(session_path, text)
+        self.assertNotIn("token", text.lower())
+
 
 def _ok_poster(session, request):
     return {"ok": True, "command": request["command"], "result": {}}

@@ -547,10 +547,17 @@ def main(argv: list[str] | None = None) -> int:
     session_path = _option_value(argv, "--session")
     if "--help" in argv or "-h" in argv:
         sys.stdout.write(
-            "Usage: blib_hou_mcp.py [--session PATH] [--print-config] [--status|--doctor]\n"
+            "Usage: blib_hou_mcp.py [--session PATH] [--print-config] [--print-codex-config] [--status|--doctor]\n"
             "\n"
             "Runs a stdio MCP adapter for the local Blib Houdini Bridge.\n"
         )
+        return 0
+    if "--print-codex-config" in argv:
+        script = _default_cli_path()
+        args = [script]
+        if session_path:
+            args.extend(["--session", session_path])
+        sys.stdout.write(_codex_config_toml(sys.executable, args) + "\n")
         return 0
     if "--print-config" in argv:
         script = _default_cli_path()
@@ -572,6 +579,17 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(json.dumps(adapter.status(include_health=True), ensure_ascii=False, indent=2, sort_keys=True) + "\n")
         return 0
     return run_stdio(BridgeMCPAdapter(session_path=session_path))
+
+
+def _codex_config_toml(command: str, args: list[str]) -> str:
+    lines = [
+        "[mcp_servers.blib-houdini-bridge]",
+        "command = %s" % json.dumps(command),
+        "args = [",
+    ]
+    lines.extend("  %s," % json.dumps(arg) for arg in args)
+    lines.append("]")
+    return "\n".join(lines)
 
 
 def _tool_name(command: str) -> str:

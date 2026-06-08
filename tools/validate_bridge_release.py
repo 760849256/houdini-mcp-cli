@@ -50,6 +50,7 @@ REQUIRED_DOC_MARKERS = {
     "README.md": [
         "Codex, MCP clients, CLI scripts",
         "connect to Houdini",
+        "Fast Path: Connect Codex To Houdini",
         "Use With Codex Or Similar Tools",
         "%UserProfile%\\.codex\\config.toml",
         "[mcp_servers.blib-houdini-bridge]",
@@ -59,6 +60,7 @@ REQUIRED_DOC_MARKERS = {
         "python scripts\\cli\\blib_hou.py doctor",
         "python scripts\\cli\\blib_hou.py scene-snapshot --path /obj",
         "python scripts\\cli\\blib_hou_mcp.py --status",
+        "python scripts\\cli\\blib_hou_mcp.py --print-codex-config",
         "python scripts\\cli\\blib_hou_mcp.py --print-config",
         "Safety Model",
         "中文说明",

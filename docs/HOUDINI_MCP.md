@@ -12,7 +12,15 @@ existing `BlibHouBridge` RPC endpoint.
 
 ## MCP Config
 
-Print a client-ready config snippet:
+For Codex, print a TOML config block and paste it into
+`%UserProfile%\.codex\config.toml`:
+
+```powershell
+python scripts\cli\blib_hou_mcp.py --print-codex-config
+```
+
+For other MCP clients that expect JSON, print a client-ready `mcpServers`
+snippet:
 
 ```powershell
 python scripts\cli\blib_hou_mcp.py --print-config
@@ -23,11 +31,13 @@ Codex runtime and keep `scripts\cli\blib_hou_mcp.py` as the script argument.
 If you use a non-default bridge session file, include it when printing config:
 
 ```powershell
+python scripts\cli\blib_hou_mcp.py --session C:\path\to\session.json --print-codex-config
 python scripts\cli\blib_hou_mcp.py --session C:\path\to\session.json --print-config
 ```
 
-The generated MCP config keeps that `--session` argument but never includes the
-bridge token.
+The generated config keeps that `--session` argument but never includes the
+bridge token. Do not paste the JSON `mcpServers` snippet directly into Codex;
+use `--print-codex-config` for Codex.
 
 ## Import Boundary
 

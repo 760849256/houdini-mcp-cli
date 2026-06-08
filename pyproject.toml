@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blib-houdini-bridge"
+version = "0.2.0"
+description = "Safe local Houdini control bridge with CLI and MCP adapter."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+  { name = "Blib Tools" }
+]
+keywords = ["houdini", "mcp", "bridge", "ai-tools", "dcc"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+
+[project.urls]
+Homepage = "https://github.com/760849256/houdini-mcp-cli"
+Documentation = "https://github.com/760849256/houdini-mcp-cli#readme"
+Issues = "https://github.com/760849256/houdini-mcp-cli/issues"
+
+[project.scripts]
+blib-hou = "blib_hou:main"
+blib-hou-mcp = "blib_hou_mcp.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "scripts/python"}
+py-modules = ["blib_hou"]
+
+[tool.setuptools.packages.find]
+where = ["scripts/python"]
+include = ["blib_hou_bridge*", "blib_hou_mcp*"]

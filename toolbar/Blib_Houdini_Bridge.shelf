@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<shelfDocument>
+  <toolshelf name="Blib_Houdini_Bridge" label="Blib Bridge">
+    <memberTool name="Blib_hou_bridge"/>
+    <memberTool name="Blib_hou_bridge_inspector"/>
+    <memberTool name="Blib_hou_bridge_edit_on"/>
+    <memberTool name="Blib_hou_bridge_edit_off"/>
+  </toolshelf>
+
+  <tool name="Blib_hou_bridge" label="Bridge" icon="NETWORKS_driver">
+    <helpText><![CDATA["""Start or stop the local read-only Houdini bridge for Codex CLI control."""]]></helpText>
+    <toolSubmenu>Blib Bridge/</toolSubmenu>
+    <script scriptType="python"><![CDATA[from blib_hou_bridge import shelf
+import importlib
+importlib.reload(shelf)
+shelf.toggle_server()]]></script>
+  </tool>
+
+  <tool name="Blib_hou_bridge_inspector" label="Inspector" icon="BUTTONS_info">
+    <helpText><![CDATA["""Open the Blib Houdini Bridge status and command inspector."""]]></helpText>
+    <toolSubmenu>Blib Bridge/</toolSubmenu>
+    <script scriptType="python"><![CDATA[from blib_hou_bridge import shelf
+import importlib
+importlib.reload(shelf)
+shelf.show_inspector()]]></script>
+  </tool>
+
+  <tool name="Blib_hou_bridge_edit_on" label="Edit On" icon="BUTTONS_gear">
+    <helpText><![CDATA["""Allow safe bridge edit commands until disabled or Houdini exits."""]]></helpText>
+    <toolSubmenu>Blib Bridge/</toolSubmenu>
+    <script scriptType="python"><![CDATA[from blib_hou_bridge import shelf
+import importlib
+importlib.reload(shelf)
+shelf.set_edit_mode(True)]]></script>
+  </tool>
+
+  <tool name="Blib_hou_bridge_edit_off" label="Edit Off" icon="BUTTONS_gear">
+    <helpText><![CDATA["""Return the bridge to read-only mode."""]]></helpText>
+    <toolSubmenu>Blib Bridge/</toolSubmenu>
+    <script scriptType="python"><![CDATA[from blib_hou_bridge import shelf
+import importlib
+importlib.reload(shelf)
+shelf.set_edit_mode(False)]]></script>
+  </tool>
+</shelfDocument>

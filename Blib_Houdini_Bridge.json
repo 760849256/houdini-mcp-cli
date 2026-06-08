@@ -1,0 +1,8 @@
+{
+    "env": [
+        {
+            "BLIB_HOUDINI_BRIDGE": "__REPLACE_WITH_ABSOLUTE_BRIDGE_ROOT__"
+        }
+    ],
+    "path": "$BLIB_HOUDINI_BRIDGE"
+}

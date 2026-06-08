@@ -3381,6 +3381,50 @@ class BlibHouBridgeTests(unittest.TestCase):
             self.assertEqual(payload["path"], "$BLIB_HOUDINI_BRIDGE")
             self.assertEqual(payload["env"][0]["BLIB_HOUDINI_BRIDGE"], release_root.resolve().as_posix())
 
+    def test_install_houdini_package_discovers_user_package_dir(self):
+        tool = _load_tool_module("install_houdini_package")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            release_root = Path(tmpdir) / "bridge"
+            (home / "Documents" / "houdini20.5").mkdir(parents=True)
+            (release_root / "toolbar").mkdir(parents=True)
+            (release_root / "toolbar" / "Blib_Houdini_Bridge.shelf").write_text("<shelfDocument />", encoding="utf-8")
+            (release_root / "scripts" / "python" / "blib_hou_bridge").mkdir(parents=True)
+            (release_root / "scripts" / "python" / "blib_hou_bridge" / "__init__.py").write_text("", encoding="utf-8")
+            (release_root / "scripts" / "python" / "blib_hou_mcp").mkdir(parents=True)
+            (release_root / "scripts" / "python" / "blib_hou_mcp" / "__init__.py").write_text("", encoding="utf-8")
+
+            result = tool.install_package(release_root, home=home)
+
+            target = home / "Documents" / "houdini20.5" / "packages" / "Blib_Houdini_Bridge.json"
+            self.assertTrue(result["installed"])
+            self.assertEqual(result["target"], str(target))
+            self.assertTrue(target.exists())
+            payload = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(payload["env"][0]["BLIB_HOUDINI_BRIDGE"], release_root.resolve().as_posix())
+
+    def test_install_houdini_package_falls_back_to_local_package(self):
+        tool = _load_tool_module("install_houdini_package")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            release_root = Path(tmpdir) / "bridge"
+            (home / "Documents").mkdir(parents=True)
+            (release_root / "toolbar").mkdir(parents=True)
+            (release_root / "toolbar" / "Blib_Houdini_Bridge.shelf").write_text("<shelfDocument />", encoding="utf-8")
+            (release_root / "scripts" / "python" / "blib_hou_bridge").mkdir(parents=True)
+            (release_root / "scripts" / "python" / "blib_hou_bridge" / "__init__.py").write_text("", encoding="utf-8")
+            (release_root / "scripts" / "python" / "blib_hou_mcp").mkdir(parents=True)
+            (release_root / "scripts" / "python" / "blib_hou_mcp" / "__init__.py").write_text("", encoding="utf-8")
+
+            result = tool.install_package(release_root, home=home)
+
+            local_package = release_root / "Blib_Houdini_Bridge.local.json"
+            self.assertFalse(result["installed"])
+            self.assertIsNone(result["target"])
+            self.assertEqual(Path(result["local_package"]).resolve(), local_package.resolve())
+            self.assertTrue(local_package.exists())
+            self.assertIn("No Houdini user package folder", result["next_action"])
+
     def test_clean_release_artifacts_removes_runtime_files(self):
         tool = _load_tool_module("clean_release_artifacts")
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3430,6 +3474,7 @@ class BlibHouBridgeTests(unittest.TestCase):
         tool = _load_tool_module("validate_bridge_release")
         self.assertIn("tools/acceptance_smoke.py", tool.REQUIRED_PATHS)
         self.assertIn("tools/clean_release_artifacts.py", tool.REQUIRED_PATHS)
+        self.assertIn("tools/install_houdini_package.py", tool.REQUIRED_PATHS)
         self.assertIn("tools/write_houdini_package.py", tool.REQUIRED_PATHS)
         self.assertIn("Codex, MCP clients, CLI scripts", tool.REQUIRED_DOC_MARKERS["README.md"])
         self.assertIn("connect to Houdini", tool.REQUIRED_DOC_MARKERS["README.md"])
@@ -3438,6 +3483,7 @@ class BlibHouBridgeTests(unittest.TestCase):
         self.assertIn("%UserProfile%\\.codex\\config.toml", tool.REQUIRED_DOC_MARKERS["README.md"])
         self.assertIn("[mcp_servers.blib-houdini-bridge]", tool.REQUIRED_DOC_MARKERS["README.md"])
         self.assertIn("codex mcp list", tool.REQUIRED_DOC_MARKERS["README.md"])
+        self.assertIn("python tools\\install_houdini_package.py", tool.REQUIRED_DOC_MARKERS["README.md"])
         self.assertIn("python tools\\write_houdini_package.py --output Blib_Houdini_Bridge.local.json", tool.REQUIRED_DOC_MARKERS["README.md"])
         self.assertIn("docs/BRIDGE_ONLY_RELEASE.md", tool.REQUIRED_DOC_MARKERS["README.md"])
         self.assertIn("python scripts\\cli\\blib_hou.py doctor", tool.REQUIRED_DOC_MARKERS["README.md"])

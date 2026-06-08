@@ -37,6 +37,7 @@ Include these paths in a bridge-only source release:
 - `pyproject.toml`
 - `tools/acceptance_smoke.py`
 - `tools/clean_release_artifacts.py`
+- `tools/install_houdini_package.py`
 - `tools/write_houdini_package.py`
 - `tools/validate_bridge_release.py`
 - `tests/test_blib_hou_bridge.py`
@@ -55,13 +56,17 @@ is intentionally the full Blib Tools package.
 python -m pip install -e .
 ```
 
-3. Generate a package file for the receiving machine:
+3. Install or generate a package file for the receiving machine:
 
 ```powershell
+python tools\install_houdini_package.py
 python tools\write_houdini_package.py --output Blib_Houdini_Bridge.local.json
 ```
 
-   Put the generated package in a Houdini package directory and rename it to
+   `tools\install_houdini_package.py` tries to write
+   `Blib_Houdini_Bridge.json` into a Houdini user packages directory. If no
+   package directory is found, use `tools\write_houdini_package.py`, then put
+   the generated package in a Houdini package directory and rename it to
    `Blib_Houdini_Bridge.json` if needed. The checked-in
    `Blib_Houdini_Bridge.json` is a template; do not install it until
    `BLIB_HOUDINI_BRIDGE` points at the receiver's local release root.

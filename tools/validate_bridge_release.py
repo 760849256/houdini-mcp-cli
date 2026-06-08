@@ -35,6 +35,7 @@ REQUIRED_PATHS = [
     "pyproject.toml",
     "tools/acceptance_smoke.py",
     "tools/clean_release_artifacts.py",
+    "tools/install_houdini_package.py",
     "tools/write_houdini_package.py",
     "tests/test_blib_hou_bridge.py",
     "tests/test_blib_hou_mcp.py",
@@ -55,6 +56,7 @@ REQUIRED_DOC_MARKERS = {
         "%UserProfile%\\.codex\\config.toml",
         "[mcp_servers.blib-houdini-bridge]",
         "codex mcp list",
+        "python tools\\install_houdini_package.py",
         "python tools\\write_houdini_package.py --output Blib_Houdini_Bridge.local.json",
         "docs/BRIDGE_ONLY_RELEASE.md",
         "python scripts\\cli\\blib_hou.py doctor",
@@ -68,6 +70,7 @@ REQUIRED_DOC_MARKERS = {
     "docs/BRIDGE_ONLY_RELEASE.md": [
         "acceptance_smoke.py",
         "clean_release_artifacts.py",
+        "install_houdini_package.py",
         "write_houdini_package.py",
         "docs/COMPATIBILITY.md",
         "blib-hou doctor",

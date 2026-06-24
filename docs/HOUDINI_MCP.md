@@ -12,18 +12,28 @@ existing `BlibHouBridge` RPC endpoint.
 
 ## MCP Config
 
-For Codex, print a TOML config block and paste it into
-`%UserProfile%\.codex\config.toml`:
+For Codex, the least error-prone setup is to let the bridge print the Codex CLI
+registration command:
 
 ```powershell
-python scripts\cli\blib_hou_mcp.py --print-codex-config
+blib-hou-mcp --print-codex-add-command
+```
+
+Run the printed `codex mcp add blib-houdini-bridge -- ...` command on the
+receiving computer, then restart Codex or open a new Codex session.
+
+If you prefer to edit config by hand, print a TOML config block and paste it
+into `%UserProfile%\.codex\config.toml`:
+
+```powershell
+blib-hou-mcp --print-codex-config
 ```
 
 For other MCP clients that expect JSON, print a client-ready `mcpServers`
 snippet:
 
 ```powershell
-python scripts\cli\blib_hou_mcp.py --print-config
+blib-hou-mcp --print-config
 ```
 
 If `python` is not on PATH, use the Python executable from your MCP client or
@@ -31,13 +41,20 @@ Codex runtime and keep `scripts\cli\blib_hou_mcp.py` as the script argument.
 If you use a non-default bridge session file, include it when printing config:
 
 ```powershell
-python scripts\cli\blib_hou_mcp.py --session C:\path\to\session.json --print-codex-config
-python scripts\cli\blib_hou_mcp.py --session C:\path\to\session.json --print-config
+blib-hou-mcp --session C:\path\to\session.json --print-codex-add-command
+blib-hou-mcp --session C:\path\to\session.json --print-codex-config
+blib-hou-mcp --session C:\path\to\session.json --print-config
 ```
 
 The generated config keeps that `--session` argument but never includes the
 bridge token. Do not paste the JSON `mcpServers` snippet directly into Codex;
 use `--print-codex-config` for Codex.
+
+If Codex does not list the server, run `codex mcp list` first. A missing
+`blib-houdini-bridge` entry means the MCP server is not registered in that
+computer's Codex config. If the entry is present but `houdini://adapter/status`
+reports `offline`, Codex found the MCP adapter and the next step is to start
+Houdini, open the `Blib Bridge` shelf, and click `Bridge`.
 
 ## Import Boundary
 

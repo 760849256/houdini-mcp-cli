@@ -13,6 +13,12 @@ It runs a small local bridge inside Houdini, then exposes that bridge through:
 This repository contains only the standalone bridge. It does not include the
 full Blib Tools production toolkit.
 
+When this `bridge/` folder is inside the full Blib Tools checkout, the main
+`Blib_tools.json` package loads the `Blib Bridge` shelf for you. In that case,
+open Houdini and click `Blib Bridge > Bridge`; the first launch starts the local
+server and registers the Codex MCP adapter in `%UserProfile%\.codex\config.toml`.
+Restart Codex or open a new Codex session after that first registration.
+
 ## Fast Path: Connect Codex To Houdini
 
 If your goal is simply "let Codex read and control Houdini", do this:
@@ -43,16 +49,24 @@ packages folder such as `Documents\houdini20.5\packages\`, then rename it to
 4. Print the Codex MCP config:
 
 ```powershell
-python scripts\cli\blib_hou_mcp.py --print-codex-config
+blib-hou-mcp --print-codex-add-command
 ```
 
-Paste the printed TOML into:
+Run the printed `codex mcp add ...` command on the receiving computer, then
+restart Codex or open a new Codex session. If you prefer to edit config by
+hand, print the TOML block instead:
+
+```powershell
+blib-hou-mcp --print-codex-config
+```
+
+Paste that TOML into:
 
 ```text
 %UserProfile%\.codex\config.toml
 ```
 
-Restart Codex or open a new Codex session. Then ask Codex:
+Then ask Codex:
 
 ```text
 Use the blib-houdini-bridge MCP server to read houdini://adapter/status,
@@ -148,10 +162,19 @@ bridge.
 Codex uses TOML config. This repo can print the Codex-ready block for you:
 
 ```powershell
-python scripts\cli\blib_hou_mcp.py --print-codex-config
+blib-hou-mcp --print-codex-add-command
 ```
 
-Paste the output into your Codex config file:
+Run the printed command on that computer. It registers the local Bridge checkout
+with Codex as `blib-houdini-bridge`.
+
+If you prefer to edit Codex config by hand, print TOML instead:
+
+```powershell
+blib-hou-mcp --print-codex-config
+```
+
+Paste the TOML output into your Codex config file:
 
 ```text
 %UserProfile%\.codex\config.toml
@@ -193,7 +216,7 @@ such as:
 For other MCP clients that expect JSON, use:
 
 ```powershell
-python scripts\cli\blib_hou_mcp.py --print-config
+blib-hou-mcp --print-config
 ```
 
 For details about the MCP surface, see [docs/HOUDINI_MCP.md](docs/HOUDINI_MCP.md).

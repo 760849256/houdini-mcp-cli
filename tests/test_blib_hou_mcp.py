@@ -1970,6 +1970,33 @@ class BridgeMCPAdapterTests(unittest.TestCase):
         self.assertIn(session_path, text)
         self.assertNotIn("token", text.lower())
 
+    def test_cli_print_codex_add_command_outputs_registration_command(self):
+        session_path = "C:/Temp/blib_hou_bridge/custom-session.json"
+        with _capture_stdout() as output:
+            result = main(["--session", session_path, "--print-codex-add-command"])
+
+        text = output.getvalue()
+        self.assertEqual(result, 0)
+        self.assertIn("codex mcp add blib-houdini-bridge --", text)
+        self.assertIn("blib_hou_mcp.py", text)
+        self.assertIn("--session", text)
+        self.assertIn(session_path, text)
+        self.assertNotIn("token", text.lower())
+
+    def test_console_entrypoint_uses_sys_argv_when_argv_is_none(self):
+        old_argv = sys.argv
+        try:
+            sys.argv = ["blib-hou-mcp", "--print-codex-config"]
+            with _capture_stdout() as output:
+                result = main(None)
+        finally:
+            sys.argv = old_argv
+
+        text = output.getvalue()
+        self.assertEqual(result, 0)
+        self.assertIn("[mcp_servers.blib-houdini-bridge]", text)
+        self.assertIn("blib_hou_mcp.py", text)
+
 
 def _ok_poster(session, request):
     return {"ok": True, "command": request["command"], "result": {}}

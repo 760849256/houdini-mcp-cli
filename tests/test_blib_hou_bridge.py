@@ -24,7 +24,7 @@ def _prepend_sys_path(path):
 _prepend_sys_path(CLI_PATH)
 _prepend_sys_path(PYTHON_DIR)
 
-from blib_hou_bridge import auth, commands, dynamics_profiles, history, inspector, protocol, recipes, server, state, workflow_templates  # noqa: E402
+from blib_hou_bridge import auth, codex_setup, commands, dynamics_profiles, history, inspector, protocol, recipes, server, state, workflow_templates  # noqa: E402
 from blib_hou_bridge import shelf  # noqa: E402
 import blib_hou  # noqa: E402
 
@@ -2110,11 +2110,95 @@ class BlibHouBridgeTests(unittest.TestCase):
         self.assertIn("running = server.status().get", source)
         self.assertIn("if not running:", source)
         self.assertIn("importlib.reload(commands)", source)
+        self.assertIn("importlib.reload(codex_setup)", source)
         self.assertIn("def show_inspector", source)
         self.assertIn('"Reload"', source)
         with open(os.path.join(ROOT, "toolbar", "Blib_Houdini_Bridge.shelf"), encoding="utf-8") as handle:
             shelf_source = handle.read()
         self.assertIn("shelf.set_edit_mode(True)", shelf_source)
+
+    def test_codex_setup_writes_bridge_mcp_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / ".codex" / "config.toml"
+            result = codex_setup.ensure_codex_mcp_registered(
+                config_path=config_path,
+                python_executable="C:/Python/python.exe",
+                script_path="D:/Blib/bridge/scripts/cli/blib_hou_mcp.py",
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["changed"])
+            text = config_path.read_text(encoding="utf-8")
+            self.assertIn("[mcp_servers.blib-houdini-bridge]", text)
+            self.assertIn('command = "C:\\\\Python\\\\python.exe"', text)
+            self.assertIn('D:\\\\Blib\\\\bridge\\\\scripts\\\\cli\\\\blib_hou_mcp.py', text)
+            self.assertNotIn("token", text.lower())
+
+            second = codex_setup.ensure_codex_mcp_registered(
+                config_path=config_path,
+                python_executable="C:/Python/python.exe",
+                script_path="D:/Blib/bridge/scripts/cli/blib_hou_mcp.py",
+            )
+            self.assertFalse(second["changed"])
+
+    def test_codex_setup_keeps_plain_python_command_unresolved(self):
+        self.assertEqual(codex_setup._normalize_command("python"), "python")
+
+    def test_codex_setup_uses_codex_home_env(self):
+        old_value = os.environ.get("CODEX_HOME")
+        try:
+            os.environ["CODEX_HOME"] = "D:/CodexHome"
+            self.assertEqual(
+                codex_setup._default_codex_config_path().as_posix(),
+                "D:/CodexHome/config.toml",
+            )
+        finally:
+            if old_value is None:
+                os.environ.pop("CODEX_HOME", None)
+            else:
+                os.environ["CODEX_HOME"] = old_value
+
+    def test_codex_setup_replaces_existing_bridge_block_with_backup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / ".codex" / "config.toml"
+            config_path.parent.mkdir()
+            config_path.write_text(
+                "[mcp_servers.other]\ncommand = \"other\"\n\n"
+                "[mcp_servers.blib-houdini-bridge]\ncommand = \"old\"\nargs = [\"old.py\"]\n\n"
+                "[features]\nfast_mode = true\n",
+                encoding="utf-8",
+            )
+
+            result = codex_setup.ensure_codex_mcp_registered(
+                config_path=config_path,
+                python_executable="C:/Python/python.exe",
+                script_path="D:/Blib/bridge/scripts/cli/blib_hou_mcp.py",
+            )
+
+            text = config_path.read_text(encoding="utf-8")
+            self.assertTrue(result["changed"])
+            self.assertTrue(Path(result["backup_path"]).exists())
+            self.assertIn("[mcp_servers.other]", text)
+            self.assertIn("[features]", text)
+            self.assertNotIn('command = "old"', text)
+
+    def test_shelf_start_registers_codex_mcp(self):
+        calls = []
+        original = shelf._ensure_codex_setup
+        try:
+            shelf._ensure_codex_setup = lambda: calls.append(True) or {
+                "ok": True,
+                "changed": True,
+                "message": "registered",
+            }
+            result = shelf.toggle_server()
+        finally:
+            shelf._ensure_codex_setup = original
+
+        self.assertTrue(result["running"])
+        self.assertEqual(calls, [True])
+        self.assertIn("codex_setup", result)
+        self.assertIn("Restart Codex", result["codex_message"])
 
     def test_running_shelf_message_handles_status_mode_key(self):
         fake_hou = FakeShelfHou(choice=0)

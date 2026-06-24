@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 
-from . import auth, commands, inspector, protocol, server, state
+from . import auth, codex_setup, commands, inspector, protocol, server, state
 
 
 def toggle_server() -> dict:
@@ -12,6 +12,7 @@ def toggle_server() -> dict:
     if not running:
         importlib.reload(protocol)
         importlib.reload(auth)
+        importlib.reload(codex_setup)
         importlib.reload(state)
         importlib.reload(commands)
         importlib.reload(server)
@@ -27,11 +28,15 @@ def toggle_server() -> dict:
         message = result.get("message", "")
     else:
         result = server.start_server()
+        setup = _ensure_codex_setup()
+        result["codex_setup"] = setup
+        result["codex_message"] = _codex_message(setup)
         message = (
             "Blib Houdini Bridge is running in read-only mode.\n"
             "Host: {host}\n"
             "Port: {port}\n"
-            "Session: {session_path}"
+            "Session: {session_path}\n\n"
+            "{codex_message}"
         ).format(**result)
 
     if hou is not None:
@@ -55,12 +60,33 @@ def show_inspector():
     if not server.status().get("running"):
         importlib.reload(protocol)
         importlib.reload(auth)
+        importlib.reload(codex_setup)
         importlib.reload(state)
         importlib.reload(commands)
         importlib.reload(server)
         server.start_server()
+        _ensure_codex_setup()
     importlib.reload(inspector)
     return inspector.show()
+
+
+def _ensure_codex_setup() -> dict:
+    try:
+        return codex_setup.ensure_codex_mcp_registered()
+    except Exception as exc:  # noqa: BLE001 - surface setup problems in Houdini UI.
+        return {
+            "ok": False,
+            "changed": False,
+            "message": "Codex MCP auto-setup failed: %s" % exc,
+        }
+
+
+def _codex_message(setup: dict | None) -> str:
+    if not isinstance(setup, dict):
+        return "Codex MCP setup was not checked."
+    if setup.get("changed"):
+        return "Codex MCP registered. Restart Codex or open a new session."
+    return str(setup.get("message") or "Codex MCP setup already exists.")
 
 
 def _running_server_action(hou, status: dict) -> dict:

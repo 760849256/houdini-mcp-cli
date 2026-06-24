@@ -543,14 +543,22 @@ def run_stdio(adapter: BridgeMCPAdapter | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    argv = argv or []
+    if argv is None:
+        argv = sys.argv[1:]
     session_path = _option_value(argv, "--session")
     if "--help" in argv or "-h" in argv:
         sys.stdout.write(
-            "Usage: blib_hou_mcp.py [--session PATH] [--print-config] [--print-codex-config] [--status|--doctor]\n"
+            "Usage: blib_hou_mcp.py [--session PATH] [--print-config] [--print-codex-config] [--print-codex-add-command] [--status|--doctor]\n"
             "\n"
             "Runs a stdio MCP adapter for the local Blib Houdini Bridge.\n"
         )
+        return 0
+    if "--print-codex-add-command" in argv:
+        script = _default_cli_path()
+        args = [script]
+        if session_path:
+            args.extend(["--session", session_path])
+        sys.stdout.write(_codex_add_command(sys.executable, args) + "\n")
         return 0
     if "--print-codex-config" in argv:
         script = _default_cli_path()
@@ -590,6 +598,19 @@ def _codex_config_toml(command: str, args: list[str]) -> str:
     lines.extend("  %s," % json.dumps(arg) for arg in args)
     lines.append("]")
     return "\n".join(lines)
+
+
+def _codex_add_command(command: str, args: list[str]) -> str:
+    parts = ["codex", "mcp", "add", SERVER_NAME, "--", command]
+    parts.extend(args)
+    return " ".join(_powershell_quote(part) for part in parts)
+
+
+def _powershell_quote(value: str) -> str:
+    text = str(value)
+    if text and all(ch.isalnum() or ch in "-_./:" for ch in text):
+        return text
+    return "'" + text.replace("'", "''") + "'"
 
 
 def _tool_name(command: str) -> str:

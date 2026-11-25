@@ -7,8 +7,14 @@ Model Context Protocol facade for external AI clients.
 
 from __future__ import annotations
 
+import base64
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import socket
+import tempfile
+import time
 import hashlib
 import sys
 import urllib.error
@@ -17,17 +23,32 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
-from blib_hou_bridge import auth, protocol, workflow_templates
+from blib_hou_bridge import auth, codex_setup, protocol, workflow_templates
+from blib_hou_bridge.connection import Connection, ConnectionError, failure, scoped
+from . import quick_tools
+from .requests import RequestControl
+from .responses import scoped_response
 
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
-SERVER_NAME = "blib-houdini-bridge"
+SERVER_NAME = codex_setup.SERVER_NAME
 SERVER_VERSION = protocol.BRIDGE_VERSION
-ADAPTER_VERSION = "0.1.0"
+ADAPTER_VERSION = "0.2.0"
+ADAPTER_ABOUT_URI = "houdini://adapter/about"
+ADAPTER_INSTRUCTIONS = (
+    "Blib Houdini Bridge connects to a local Houdini session. Start with houdini_context "
+    "to confirm the active instance, scene, selection, and permissions. Scene changes require "
+    "Houdini editable mode, which includes custom Python. Read houdini://adapter/about "
+    "for tool discovery and houdini://connection/current for connection status. "
+    "When the user provides a Bridge control code, call houdini_context with control_code "
+    "and confirm the HIP. Pass the same control_code and the returned session_id as target_instance "
+    "on every subsequent Houdini tool call. On a mismatch, stop and ask which HIP is intended."
+)
 
 READ_TOOL_COMMANDS = frozenset(
     {
         "context",
+        "python_job_status",
         "selected",
         "scene_snapshot",
         "node_info",
@@ -42,6 +63,13 @@ READ_TOOL_COMMANDS = frozenset(
         "rpc_log",
         "edit_mode",
         "find_nodes",
+        "find_error_nodes",
+        "geometry_summary",
+        "parameter_schema",
+        "multi_read",
+        "diagnostic_bundle",
+        "material_info",
+        "render_info",
     }
 )
 
@@ -78,11 +106,28 @@ class BridgeMCPAdapter:
         workflow_root: str | os.PathLike | None = None,
         session_loader: Callable[[str | None], dict[str, Any] | None] | None = None,
         poster: Callable[[dict[str, Any], str], dict[str, Any]] | None = None,
+        tool_profile: str = "advanced",
+        instance: str | None = None,
+        response_profile: str = "full",
     ):
+        if tool_profile not in {"daily", "advanced"}:
+            raise ValueError("tool_profile must be daily or advanced")
+        self.tool_profile = tool_profile
+        if response_profile not in {"full", "compact"}:
+            raise ValueError("response_profile must be full or compact")
+        self.response_profile = response_profile
         self.session_path = session_path
         self.workflow_root = Path(workflow_root) if workflow_root is not None else _default_workflow_root()
         self._session_loader = session_loader or auth.load_session
         self._poster = poster or self._post_to_bridge
+        self._default_connection = Connection(session_path, instance, session_loader, poster)
+        self._tool_route = threading.local()
+        self._code_connections = {}
+        self._code_lock = threading.Lock()
+
+    @property
+    def _connection(self):
+        return getattr(self._tool_route, "connection", self._default_connection)
 
     def handle_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
         method = message.get("method")
@@ -116,12 +161,32 @@ class BridgeMCPAdapter:
         return {
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": {"tools": {}, "resources": {}},
-            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            "serverInfo": {"name": SERVER_NAME, "title": "Blib Houdini Bridge", "version": SERVER_VERSION},
+            "instructions": ADAPTER_INSTRUCTIONS,
         }
 
+    def about(self) -> dict[str, Any]:
+        return {
+            "name": SERVER_NAME,
+            "version": SERVER_VERSION,
+            "adapter_version": ADAPTER_VERSION,
+            "mcp_protocol_version": MCP_PROTOCOL_VERSION,
+            "transport": "stdio",
+            "tool_profile": self.tool_profile,
+            "response_profile": self.response_profile,
+            "tools": [tool["name"] for tool in self.list_tools()],
+            "getting_started": {
+                "first_tool": "houdini_context",
+                "connection": "houdini://connection/current",
+                "safety": "houdini://safety/policy",
+            },
+            "instructions": ADAPTER_INSTRUCTIONS,
+        }
+
+    @scoped
     def status(self, include_health: bool = True) -> dict[str, Any]:
         session = self._sanitized_session()
-        tools = self.list_tools()
+        tools = self.list_tools(profile="advanced")
         workflow_index = self._workflow_index()
         workflow_evidence = _workflow_evidence_status(workflow_index)
         tool_names = {tool["name"] for tool in tools}
@@ -136,10 +201,10 @@ class BridgeMCPAdapter:
             command for command in protocol.PLAN_REQUIRED_EDIT_COMMANDS if _tool_name(command) in tool_names
         )
         unexpected_direct_edit_commands = sorted(
-            _command_from_tool(tool["name"])
+            tool.get("_meta", {}).get("bridgeCommand") or _command_from_tool(tool["name"])
             for tool in tools
             if tool.get("_meta", {}).get("exposure") == "direct_edit"
-            and _command_from_tool(tool["name"]) not in DIRECT_EDIT_TOOL_COMMANDS
+            and (tool.get("_meta", {}).get("bridgeCommand") or _command_from_tool(tool["name"])) not in DIRECT_EDIT_TOOL_COMMANDS
         )
         policy_audit = _tool_policy_audit(tools)
         safety = {
@@ -170,6 +235,8 @@ class BridgeMCPAdapter:
                 )
         readiness = _adapter_readiness(session, bridge_health, workflow_evidence, safety, scene_routing)
         client_bootstrap = _client_bootstrap(readiness, workflow_evidence, scene_routing, safety)
+        workflow_count = len(self._workflow_resources())
+        resources = self.list_resources(include_workflows=False)
         result = {
             "adapter": {
                 "name": SERVER_NAME,
@@ -179,6 +246,8 @@ class BridgeMCPAdapter:
             },
             "session": session,
             "tools": {
+                "profile": self.tool_profile,
+                "advertised_count": len(self.list_tools()),
                 "count": len(tools),
                 "read_count": len([tool for tool in tools if tool.get("_meta", {}).get("exposure") == "read"]),
                 "direct_edit_count": len(direct_tools),
@@ -189,8 +258,8 @@ class BridgeMCPAdapter:
                 "policy_contract": policy_audit,
             },
             "resources": {
-                "static_count": len(RESOURCE_PAYLOADS) + len(LOCAL_RESOURCE_PAYLOADS) + 3,
-                "workflow_count": len(self._workflow_resources()),
+                "static_count": len(resources),
+                "workflow_count": workflow_count,
             },
             "workflow_evidence": workflow_evidence,
             "scene_routing": scene_routing,
@@ -203,7 +272,7 @@ class BridgeMCPAdapter:
             result["bridge_health"] = bridge_health
         return result
 
-    def list_tools(self) -> list[dict[str, Any]]:
+    def list_tools(self, profile: str | None = None) -> list[dict[str, Any]]:
         manifest = protocol.command_manifest()
         commands = manifest.get("commands", {})
         tools = []
@@ -244,9 +313,62 @@ class BridgeMCPAdapter:
                 },
             }
         )
-        return tools
+        context_tool = next(tool for tool in tools if tool["name"] == "houdini_context")
+        context_tool["inputSchema"].setdefault("properties", {})["instance"] = {
+            "type": "string", "description": "Select a registered instance on an automatic connection, or omit to keep the current target. A launch configuration with --instance is fixed."}
+        context_tool["description"] += " Use control_code from the Bridge control center to match a Houdini and return its HIP and session_id."
+        combined = quick_tools.tool_definitions() + tools
+        for tool in combined:
+            if tool["name"] not in LOCAL_TOOL_NAMES:
+                properties = tool["inputSchema"].setdefault("properties", {})
+                properties["control_code"] = {
+                    "type": "string", "description": "Control code shown in the intended Houdini's Bridge control center."}
+                properties["target_instance"] = {
+                    "type": "string", "description": "The session_id from houdini_context for this code. Required on subsequent code-routed calls."}
+        if (profile or self.tool_profile) == "daily":
+            names = ["houdini_context", "houdini_inspect", "houdini_edit", "houdini_execute", "houdini_look", "houdini_job"]
+            by_name = {tool["name"]: tool for tool in combined}
+            return [by_name[name] for name in names]
+        return combined
 
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(arguments, dict) or not ({"control_code", "target_instance"} & arguments.keys()):
+            return self._call_tool(tool_name, arguments)
+        arguments = dict(arguments)
+        code = arguments.pop("control_code", None)
+        target = arguments.pop("target_instance", None)
+        try:
+            if tool_name in LOCAL_TOOL_NAMES or "instance" in arguments:
+                raise ConnectionError("bad_request", "Use control_code only with a Houdini tool, without the instance argument.")
+            if not isinstance(target, str) or not target:
+                if target is not None or tool_name != "houdini_context":
+                    raise ConnectionError("target_instance_required", "First call houdini_context with the control code and pass its session_id as target_instance.")
+            base = self._default_connection
+            code, instance = base.match_control_code(code, target)
+            if "session_id" in arguments and arguments["session_id"] != instance:
+                raise ConnectionError("instance_mismatch", "The job belongs to a different Houdini instance.")
+        except ConnectionError as exc:
+            return _tool_result(failure(exc.code, str(exc), executed=False), is_error=True)
+        key = (code, instance)
+        with self._code_lock:
+            connection = self._code_connections.get(key)
+            if connection is None:
+                connection = Connection(base.session_path, instance, control_code=code)
+                if len(self._code_connections) >= 32:
+                    self._code_connections.pop(next(iter(self._code_connections)))
+                self._code_connections[key] = connection
+        self._tool_route.connection = connection
+        try:
+            with connection.request_scope(base.request_control):
+                return self._call_tool(tool_name, arguments)
+        finally:
+            del self._tool_route.connection
+
+    @scoped
+    @scoped_response
+    def _call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool_name in quick_tools.NAMES:
+            return quick_tools.call(self, tool_name, arguments)
         if tool_name in LOCAL_TOOL_NAMES:
             if not isinstance(arguments, dict):
                 raise McpError(-32602, "Tool arguments must be a JSON object.")
@@ -260,11 +382,39 @@ class BridgeMCPAdapter:
         if prepared.get("ok") is False:
             return _tool_result(prepared, is_error=True)
         response = self._rpc(command, prepared.get("payload", arguments))
+        if command == "python_submit" and response.get("ok"):
+            response = self._wait_for_python_job(response, prepared.get("wait_ms", 600))
         if command == "run_plan":
             response = _annotate_run_plan_response(response, prepared)
         elif command in DIRECT_EDIT_TOOL_COMMANDS:
             response = _annotate_direct_edit_response(command, response)
-        return _tool_result(response, is_error=not bool(response.get("ok")))
+        job_status = (response.get("result") or {}).get("status") if command == "python_submit" else None
+        if job_status in {"failed", "cancelled"}:
+            response = deepcopy(response)
+            response["ok"] = False
+            response["error"] = {"code": "python_" + job_status, "message": "Python job " + job_status + "; inspect the job output and scene before retrying."}
+        result = _tool_result(response, is_error=not bool(response.get("ok")))
+        if command == "viewport_screenshot" and response.get("ok"):
+            _append_viewport_image(result, response)
+        return result
+
+    def _wait_for_python_job(self, response: dict[str, Any], wait_ms: int) -> dict[str, Any]:
+        job = response.get("result") or {}
+        job_id = job.get("job_id")
+        deadline = time.monotonic() + wait_ms / 1000.0
+        poll_interval = 0.05
+        while job_id and job.get("status") in {"queued", "running"} and time.monotonic() < deadline:
+            time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+            poll_interval = min(0.5, poll_interval * 1.5)
+            polled = self._rpc("python_job_status", {"job_id": job_id})
+            if not polled.get("ok"):
+                response = deepcopy(response)
+                response["result"]["poll_error"] = polled.get("error")
+                return response
+            job = polled.get("result") or job
+            response = deepcopy(response)
+            response["result"] = job
+        return response
 
     def _call_local_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if tool_name != "houdini_template_plan":
@@ -272,8 +422,18 @@ class BridgeMCPAdapter:
         response = _template_plan(arguments)
         return _tool_result(response, is_error=not bool(response.get("ok")))
 
-    def list_resources(self) -> list[dict[str, Any]]:
+    def list_resources(self, include_workflows: bool = True) -> list[dict[str, Any]]:
         resources = [
+            {"uri": ADAPTER_ABOUT_URI, "name": "About Blib Houdini Bridge", "mimeType": "application/json",
+             "description": "Tool discovery and onboarding for the active MCP profile, available offline."},
+            {"uri": "houdini://tasks/current", "name": "Tasks", "mimeType": "application/json",
+             "description": "Bounded durable host-task list; never inspects the scene."},
+            {"uri": "houdini://connection/current", "name": "Connection", "mimeType": "application/json",
+             "description": "Lightweight service and main-thread health; never scans the scene."},
+            {"uri": "houdini://instances", "name": "Instances", "mimeType": "application/json",
+             "description": "Registered Houdini instances, including stale records; credentials omitted."},
+            {"uri": "houdini://diagnostics/current", "name": "Diagnostics", "mimeType": "application/json",
+             "description": "Bounded local connection and diagnostic metadata; no scene scan."},
             {
                 "uri": "houdini://adapter/status",
                 "name": "Blib Houdini MCP adapter status",
@@ -335,10 +495,29 @@ class BridgeMCPAdapter:
                 "mimeType": "application/json",
             },
         ]
-        resources.extend(self._workflow_resources())
+        if include_workflows:
+            resources.extend(self._workflow_resources())
         return resources
 
+    @scoped
     def read_resource(self, uri: str) -> dict[str, Any]:
+        if uri == ADAPTER_ABOUT_URI:
+            return {"contents": [{"uri": uri, "mimeType": "application/json",
+                                  "text": json.dumps({"ok": True, "result": self.about()})}]}
+        if uri == "houdini://tasks/current":
+            payload = self._connection.list_tasks()
+            return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
+        if uri in {"houdini://connection/current", "houdini://diagnostics/current", "houdini://instances", "houdini://tasks/current"}:
+            if uri == "houdini://connection/current":
+                payload = self.connection_status()
+            elif uri == "houdini://diagnostics/current":
+                payload = self.diagnostics()
+            elif uri == "houdini://tasks/current":
+                payload = self._connection.list_tasks()
+            else:
+                payload = {"instances": [auth.public_session(s) for s in auth.discover_sessions(self.session_path)]}
+            return {"contents": [{"uri": uri, "mimeType": "application/json",
+                                  "text": json.dumps(payload, ensure_ascii=False)}]}
         if uri == "houdini://workflow/index":
             payload = {"ok": True, "result": self._workflow_index()}
             return {
@@ -405,61 +584,39 @@ class BridgeMCPAdapter:
         }
 
     def _rpc(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
-        session = self._session_loader(self.session_path)
-        if session is None:
-            return {
-                "ok": False,
-                "command": command,
-                "result": {},
-                "error": {
-                    "code": "offline",
-                    "message": "No active Blib Houdini Bridge session was found. Start the Houdini bridge shelf tool first.",
-                },
-            }
-        try:
-            request = protocol.make_request(command, payload, token=session["token"])
-        except Exception as exc:
-            return {
-                "ok": False,
-                "command": command,
-                "result": {},
-                "error": {"code": "bad_request", "message": str(exc)},
-            }
-        return self._poster(session, request)
+        if self._connection._custom:
+            self._connection._poster = self._poster
+        return self._connection.call(command, payload)
 
-    def _post_to_bridge(self, session: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
-        body = json.dumps(request).encode("utf-8")
-        http_request = urllib.request.Request(
-            "http://%s:%s/rpc" % (session["host"], session["port"]),
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-Blib-Bridge-Token": session["token"],
-            },
-        )
-        try:
-            with urllib.request.urlopen(http_request, timeout=5) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            try:
-                return json.loads(exc.read().decode("utf-8"))
-            except Exception:
-                return _bridge_error("http_error", "Bridge HTTP error: %s" % exc)
-        except Exception as exc:
-            return _bridge_error("unreachable", "Could not reach Blib Houdini Bridge: %s" % exc)
+    @scoped
+    def _task_call(self, command, payload, job_id=None, wait_ms=1000, queue_timeout_ms=15000):
+        from blib_hou_bridge.tasks import task_response
+        receipt = self._connection.submit_task(command, payload, job_id=job_id, wait_ms=wait_ms,
+                                               queue_timeout_ms=queue_timeout_ms)
+        if not receipt.get("ok"):
+            return receipt
+        response = task_response(receipt["result"])
+        response.setdefault("result", {}).setdefault("job_id", receipt["result"]["job_id"])
+        response["result"].setdefault("task_status", receipt["result"]["status"])
+        return response
+
+    def _post_to_bridge(self, session, request):
+        return self._connection._send(session, request)
+
+    @scoped
+    def connection_status(self):
+        return self._connection.snapshot()
+
+    @scoped
+    def diagnostics(self):
+        return self._connection.diagnostics()
 
     def _sanitized_session(self) -> dict[str, Any]:
-        session = self._session_loader(self.session_path)
-        if session is None:
+        try:
+            session = self._connection._resolve()
+        except Exception:
             return {"connected": False, "session_path": str(auth.default_session_path())}
-        return {
-            "connected": True,
-            "host": session.get("host"),
-            "port": session.get("port"),
-            "pid": session.get("pid"),
-            "started_at": session.get("started_at"),
-            "has_token": bool(session.get("token")),
-        }
+        return dict(auth.public_session(session), connected=True)
 
     def _workflow_resources(self) -> list[dict[str, Any]]:
         resources = []
@@ -523,22 +680,94 @@ class BridgeMCPAdapter:
 
 def run_stdio(adapter: BridgeMCPAdapter | None = None) -> int:
     adapter = adapter or BridgeMCPAdapter()
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+    output_lock, controls_lock = threading.Lock(), threading.Lock()
+    closed = threading.Event()
+    controls = {}
+    capacity = threading.BoundedSemaphore(32)
+    workers = ThreadPoolExecutor(max_workers=4, thread_name_prefix="BlibMcpCall")
+    control_workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="BlibMcpControl")
+
+    def emit(response):
+        if response is None or closed.is_set():
+            return
+        with output_lock:
+            try:
+                sys.stdout.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
+                sys.stdout.flush()
+            except (BrokenPipeError, OSError):
+                closed.set()
+
+    def perform(message, control, key):
         try:
-            message = json.loads(line)
-            if not isinstance(message, dict):
-                raise McpError(-32600, "MCP message must be a JSON object.")
-            response = adapter.handle_message(message)
-        except McpError as exc:
-            response = {"jsonrpc": "2.0", "id": None, "error": {"code": exc.code, "message": exc.message}}
-        except Exception as exc:
-            response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}
-        if response is not None:
-            sys.stdout.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
-            sys.stdout.flush()
+            with adapter._connection.request_scope(control):
+                response = adapter.handle_message(message)
+            if control.cancel_host.is_set():
+                response = {"jsonrpc": "2.0", "id": key, "error": {
+                    "code": -32800, "message": "Request cancelled; query host jobs for their actual state.",
+                    "data": {"jobs": control.handles()}}}
+            emit(response)
+        finally:
+            with controls_lock:
+                controls.pop(key, None)
+            capacity.release()
+
+    try:
+        for line in sys.stdin:
+            if closed.is_set():
+                break
+            try:
+                message = json.loads(line)
+                if not isinstance(message, dict):
+                    raise ValueError("MCP message must be an object.")
+                method, key = message.get("method"), message.get("id")
+                if method == "notifications/cancelled":
+                    requested = (message.get("params") or {}).get("requestId")
+                    if isinstance(requested, (int, str)):
+                        with controls_lock:
+                            control = controls.get(requested)
+                        if control is not None and not control.cancel_host.is_set():
+                            control.cancel_host.set()
+                            control.stop_waiting.set()
+                            control_workers.submit(control.cancel)
+                    continue
+                if method not in {"tools/call", "resources/read"}:
+                    emit(adapter.handle_message(message))
+                    continue
+                if not isinstance(key, (int, str)) or isinstance(key, bool):
+                    emit({"jsonrpc": "2.0", "id": key, "error": {"code": -32600, "message": "A request ID is required."}})
+                    continue
+                with controls_lock:
+                    duplicate = key in controls
+                if duplicate:
+                    emit({"jsonrpc": "2.0", "id": key, "error": {"code": -32600, "message": "Request ID is already active."}})
+                    continue
+                if not capacity.acquire(blocking=False):
+                    emit({"jsonrpc": "2.0", "id": key, "error": {"code": -32000, "message": "MCP call capacity is full; no request was admitted."}})
+                    continue
+                params = message.get("params") or {}
+                if not isinstance(params, dict):
+                    capacity.release()
+                    emit({"jsonrpc": "2.0", "id": key, "error": {"code": -32602, "message": "params must be an object."}})
+                    continue
+                control = RequestControl()
+                with controls_lock:
+                    controls[key] = control
+                params = message.get("params") or {}
+                priority = (method == "tools/call" and params.get("name") == "houdini_job") or (
+                    method == "resources/read" and params.get("uri") in {
+                        "houdini://connection/current", "houdini://instances", "houdini://tasks/current"})
+                pool = control_workers if priority else workers
+                pool.submit(perform, message, control, key)
+            except (ValueError, TypeError) as exc:
+                emit({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}})
+    finally:
+        closed.set()
+        with controls_lock:
+            outstanding = list(controls.values())
+        for control in outstanding:
+            control.detach()
+        workers.shutdown(wait=True, cancel_futures=False)
+        control_workers.shutdown(wait=True, cancel_futures=False)
     return 0
 
 
@@ -546,62 +775,77 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     session_path = _option_value(argv, "--session")
+    instance = _option_value(argv, "--instance")
+    response_profile = _option_value(argv, "--response-profile") or os.environ.get("BLIB_HOU_RESPONSE_PROFILE", "compact")
+    if response_profile not in {"compact", "full"}:
+        sys.stderr.write("--response-profile must be compact or full\n")
+        return 2
+    profile = _option_value(argv, "--tool-profile") or os.environ.get("BLIB_HOU_TOOL_PROFILE", "daily")
+    if profile not in {"daily", "advanced"}:
+        sys.stderr.write("--tool-profile must be daily or advanced\n")
+        return 2
     if "--help" in argv or "-h" in argv:
         sys.stdout.write(
-            "Usage: blib_hou_mcp.py [--session PATH] [--print-config] [--print-codex-config] [--print-codex-add-command] [--status|--doctor]\n"
+            "Usage: blib_hou_mcp.py [--session PATH] [--instance ID] [--server-name NAME] [--connection|--instances|--diagnostics] [--tool-profile daily|advanced] [--response-profile compact|full] [--print-client-config codex|antigravity|generic] [--print-config] [--print-codex-config] [--print-codex-add-command] [--status|--doctor]\n"
             "\n"
             "Runs a stdio MCP adapter for the local Blib Houdini Bridge.\n"
         )
         return 0
-    if "--print-codex-add-command" in argv:
-        script = _default_cli_path()
-        args = [script]
+    add_codex = "--print-codex-add-command" in argv
+    if "--print-client-config" in argv:
+        index = argv.index("--print-client-config") + 1
+        if index >= len(argv) or argv[index] not in codex_setup.MCP_CLIENTS:
+            sys.stderr.write("--print-client-config requires codex, antigravity, or generic\n")
+            return 2
+        client = argv[index]
+    elif "--print-codex-config" in argv:
+        client = "codex"
+    elif "--print-config" in argv:
+        client = "generic"
+    else:
+        client = None
+
+    if add_codex or client:
+        requested_name = _option_value(argv, "--server-name")
+        try:
+            server_name = codex_setup.validate_server_name(
+                codex_setup.instance_server_name(instance) if requested_name is None else requested_name)
+        except ValueError as exc:
+            sys.stderr.write(str(exc) + "\n")
+            return 2
+        args = codex_setup.client_launch_args()
+        if profile != "daily" or "--tool-profile" in argv:
+            args.extend(["--tool-profile", profile])
+        if response_profile != "compact" or "--response-profile" in argv:
+            args.extend(["--response-profile", response_profile])
         if session_path:
             args.extend(["--session", session_path])
-        sys.stdout.write(_codex_add_command(sys.executable, args) + "\n")
+        if instance:
+            args.extend(["--instance", instance])
+        config = (_codex_add_command(sys.executable, args, server_name) if add_codex
+                  else codex_setup.render_client_config(client, sys.executable, args, server_name))
+        sys.stdout.write(config + "\n")
         return 0
-    if "--print-codex-config" in argv:
-        script = _default_cli_path()
-        args = [script]
-        if session_path:
-            args.extend(["--session", session_path])
-        sys.stdout.write(_codex_config_toml(sys.executable, args) + "\n")
-        return 0
-    if "--print-config" in argv:
-        script = _default_cli_path()
-        args = [script]
-        if session_path:
-            args.extend(["--session", session_path])
-        config = {
-            "mcpServers": {
-                "blib-houdini-bridge": {
-                    "command": sys.executable,
-                    "args": args,
-                }
-            }
-        }
-        sys.stdout.write(json.dumps(config, ensure_ascii=False, indent=2) + "\n")
+    if any(option in argv for option in ("--connection", "--instances", "--diagnostics")):
+        adapter = BridgeMCPAdapter(session_path=session_path, tool_profile=profile, instance=instance)
+        if "--instances" in argv:
+            result = {"instances": [auth.public_session(s) for s in auth.discover_sessions(session_path)]}
+        elif "--diagnostics" in argv:
+            result = adapter.diagnostics()
+        else:
+            result = adapter.connection_status()
+        sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
         return 0
     if "--status" in argv or "--doctor" in argv:
-        adapter = BridgeMCPAdapter(session_path=session_path)
+        adapter = BridgeMCPAdapter(session_path=session_path, tool_profile=profile, instance=instance)
         sys.stdout.write(json.dumps(adapter.status(include_health=True), ensure_ascii=False, indent=2, sort_keys=True) + "\n")
         return 0
-    return run_stdio(BridgeMCPAdapter(session_path=session_path))
+    return run_stdio(BridgeMCPAdapter(session_path=session_path, tool_profile=profile, instance=instance,
+                                    response_profile=response_profile))
 
 
-def _codex_config_toml(command: str, args: list[str]) -> str:
-    lines = [
-        "[mcp_servers.blib-houdini-bridge]",
-        "command = %s" % json.dumps(command),
-        "args = [",
-    ]
-    lines.extend("  %s," % json.dumps(arg) for arg in args)
-    lines.append("]")
-    return "\n".join(lines)
-
-
-def _codex_add_command(command: str, args: list[str]) -> str:
-    parts = ["codex", "mcp", "add", SERVER_NAME, "--", command]
+def _codex_add_command(command: str, args: list[str], server_name: str = SERVER_NAME) -> str:
+    parts = ["codex", "mcp", "add", server_name, "--", command]
     parts.extend(args)
     return " ".join(_powershell_quote(part) for part in parts)
 
@@ -624,6 +868,8 @@ def _command_from_tool(tool_name: str) -> str:
 
 
 def _tool_description(command: str, metadata: dict[str, Any]) -> str:
+    if command == "python_submit":
+        return metadata.get("description", "Submit arbitrary Python.")
     exposure = metadata.get("exposure") or protocol.command_exposure(command)
     suffix = {
         "read": "Read-only.",
@@ -655,6 +901,8 @@ def _tool_safety_contract(command: str, metadata: dict[str, Any]) -> dict[str, A
         "success_requires_evidence": True,
         "note": "Tool metadata is an audit contract only; bridge RPC and Houdini edit mode remain authoritative.",
     }
+    if command == "python_submit":
+        contract.update({"requires_houdini_python_on": False, "arbitrary_python": True, "sandboxed": False, "full_process_permissions": True})
     verification = metadata.get("verification") if isinstance(metadata.get("verification"), dict) else None
     if verification is None and command in DIRECT_EDIT_TOOL_COMMANDS:
         verification = protocol.direct_edit_verification_contract(command)
@@ -764,6 +1012,9 @@ def _tool_policy_audit(tools: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _tool_input_schema(command: str, metadata: dict[str, Any]) -> dict[str, Any]:
     schema = deepcopy(metadata.get("payload_schema") or {"type": "object"})
+    if command == "python_submit":
+        schema.setdefault("properties", {})["wait_ms"] = {"type": "integer", "minimum": 0, "maximum": 2000, "default": 600, "description": "Wait briefly for completion; longer jobs remain queryable by job_id."}
+        return schema
     if command != "run_plan":
         return schema
     properties = dict(schema.get("properties", {}))
@@ -843,6 +1094,13 @@ def _mcp_direct_edit_postflight_schema() -> dict[str, Any]:
 
 
 def _prepare_tool_arguments(command: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    if command == "python_submit":
+        wait_ms = arguments.get("wait_ms", 600)
+        if isinstance(wait_ms, bool) or not isinstance(wait_ms, int) or not 0 <= wait_ms <= 2000:
+            return _bridge_error("bad_request", "wait_ms must be an integer between 0 and 2000.")
+        payload = dict(arguments)
+        payload.pop("wait_ms", None)
+        return {"ok": True, "payload": payload, "wait_ms": wait_ms}
     if command != "run_plan":
         return {"ok": True, "payload": arguments}
     steps = arguments.get("steps")
@@ -1373,8 +1631,33 @@ def _parent_path(path: str) -> str:
     return path.rsplit("/", 1)[0] or "/"
 
 
+def _screenshot_root() -> Path:
+    return auth.runtime_dir() / "screenshots"
+
+
+def _append_viewport_image(tool_result: dict[str, Any], response: dict[str, Any]) -> None:
+    """Attach only the bridge's own bounded PNG screenshot; preserve the text result."""
+    try:
+        screenshot = response.get("result", {}).get("path")
+        if not isinstance(screenshot, str):
+            raise ValueError("screenshot path missing")
+        root = _screenshot_root().resolve(strict=True)
+        path = Path(screenshot).resolve(strict=True)
+        if path.parent != root or path.suffix.lower() != ".png":
+            raise ValueError("screenshot is outside the bridge screenshot directory")
+        with path.open("rb") as handle:
+            data = handle.read(8 * 1024 * 1024 + 1)
+        if len(data) > 8 * 1024 * 1024 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("screenshot is not a supported PNG under 8 MiB")
+        tool_result["content"].append({"type": "image", "mimeType": "image/png", "data": base64.b64encode(data).decode("ascii")})
+    except (OSError, ValueError, TypeError) as exc:
+        tool_result["content"].append({"type": "text", "text": "Viewport image could not be attached: %s" % exc})
+
+
 def _tool_result(response: dict[str, Any], is_error: bool = False) -> dict[str, Any]:
-    text = json.dumps(response, ensure_ascii=False, indent=2, sort_keys=True)
+    from .responses import profile, compact
+    body = compact(response) if profile.get() == "compact" else response
+    text = json.dumps(body, ensure_ascii=False, indent=None if profile.get() == "compact" else 2, sort_keys=True)
     return {
         "content": [{"type": "text", "text": text}],
         "structuredContent": response,
@@ -1384,11 +1667,6 @@ def _tool_result(response: dict[str, Any], is_error: bool = False) -> dict[str, 
 
 def _bridge_error(code: str, message: str) -> dict[str, Any]:
     return {"ok": False, "result": {}, "error": {"code": code, "message": message}}
-
-
-def _default_cli_path() -> str:
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    return os.path.join(root, "scripts", "cli", "blib_hou_mcp.py")
 
 
 def _option_value(argv: list[str], option: str) -> str | None:
@@ -2027,7 +2305,7 @@ def _adapter_readiness(
         next_actions.extend(scene_routing.get("next_actions", []) if isinstance(scene_routing.get("next_actions"), list) else [])
     if not next_actions:
         next_actions.append("Use houdini_context or houdini_scene_snapshot as the first read tool.")
-    first_read_tools = ["houdini_context", "houdini_scene_snapshot", "houdini_edit_mode"]
+    first_read_tools = ["houdini_context", "houdini_scene_snapshot", "houdini_find_error_nodes", "houdini_edit_mode"]
     if isinstance(scene_routing.get("first_read_tools"), list):
         first_read_tools.extend(str(tool) for tool in scene_routing["first_read_tools"] if isinstance(tool, str))
     return {

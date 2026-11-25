@@ -19,7 +19,8 @@ PYTHON_DIR = os.path.join(ROOT, "scripts", "python")
 if PYTHON_DIR not in sys.path:
     sys.path.insert(0, PYTHON_DIR)
 
-from blib_hou_bridge import auth, dynamics_profiles, protocol, workflow_templates  # noqa: E402
+from blib_hou_bridge.connection import Connection, ConnectionError
+from blib_hou_bridge import auth, commands, dynamics_profiles, protocol, workflow_templates  # noqa: E402
 
 
 HEALTH_CACHE_TTL_SECONDS = 10.0
@@ -29,7 +30,17 @@ ROLLBACK_REQUIRED_FLOW = ["houdini_review_plan", "houdini_validate_plan", "houdi
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="blib-hou", description="Client for the local Blib Houdini Bridge.")
     parser.add_argument("--session", default=None, help="Path to a bridge session JSON file.")
+    parser.add_argument("--instance", default=None, help="Bind to one registered Houdini instance ID.")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    def add_fields(argument_parser: argparse.ArgumentParser) -> None:
+        argument_parser.add_argument("--fields", nargs="+", default=None, help="Optional dot-path field projection for smaller read responses.")
+
+    job_parser = subparsers.add_parser("job", help="Query, list or cancel durable jobs.")
+    job_parser.add_argument("action", choices=("status", "cancel", "list"))
+    job_parser.add_argument("job_id", nargs="?")
+    subparsers.add_parser("instances", help="List registered instances without credentials.")
+    subparsers.add_parser("connection", help="Read lightweight connection and main-thread health.")
+    subparsers.add_parser("diagnostics", help="Read a bounded, credential-free diagnostic bundle.")
     subparsers.add_parser("doctor", help="Diagnose session loading and bridge RPC health.")
     subparsers.add_parser("status", help="Check whether the bridge is reachable.")
     subparsers.add_parser("manifest", help="Read the bridge command manifest.")
@@ -38,7 +49,9 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("context", help="Read Houdini session context.")
     subparsers.add_parser("selected", help="Read selected Houdini nodes.")
     snapshot_parser = subparsers.add_parser("scene-snapshot", help="Read a compact scene context bundle.")
+    add_fields(snapshot_parser)
     snapshot_parser.add_argument("--path", default=None, help="Network path to summarize. Defaults to the current network.")
+    snapshot_parser.add_argument("--mode", choices=("full", "routing", "summary"), default="full", help="Snapshot work mode. full preserves legacy detail; routing and summary skip heavier details.")
     snapshot_parser.add_argument("--trace-depth", type=int, default=1, help="Selected-node trace depth, 0-4.")
     snapshot_parser.add_argument("--max-selected", type=int, default=3, help="Maximum selected nodes to detail, 0-20.")
     snapshot_parser.add_argument("--include-viewport", action="store_true", help="Capture the current Scene Viewer viewport.")
@@ -52,12 +65,81 @@ def main(argv: list[str] | None = None) -> int:
     find_parser.add_argument("--category", default=None, help="Case-insensitive category contains filter.")
     find_parser.add_argument("--path", default=None, dest="path_filter", help="Case-insensitive path contains filter.")
     find_parser.add_argument("--limit", type=int, default=100, help="Maximum matches, 1-500.")
+    add_fields(find_parser)
     log_parser = subparsers.add_parser("rpc-log", help="Read recent bridge RPC request history.")
     log_parser.add_argument("--limit", type=int, default=50, help="Number of recent events, 0-200.")
+    node_types_parser = subparsers.add_parser("list-node-types", help="List Houdini node types with filtering and pagination.")
+    add_fields(node_types_parser)
+    node_types_parser.add_argument("--category", default=None, help="Optional category filter, such as Sop or Lop.")
+    node_types_parser.add_argument("--name", default=None, help="Optional node type or description substring filter.")
+    node_types_parser.add_argument("--limit", type=int, default=100, help="Maximum results, 1-500.")
+    node_types_parser.add_argument("--offset", type=int, default=0, help="Pagination offset.")
+    node_types_parser.add_argument("--refresh", action="store_true", help="Refresh the short-lived node type cache.")
+    help_parser = subparsers.add_parser("get-houdini-help", aliases=["houdini-help"], help="Return SideFX docs links and local Houdini node type matches.")
+    help_parser.add_argument("item_name", nargs="?", default="", help="Node type, expression, command, Python symbol, or search text.")
+    help_parser.add_argument("--help-type", choices=("node", "expression", "hscript", "python", "general"), default="node", help="Help item category.")
+    help_parser.add_argument("--category", default=None, help="Optional node category filter for local catalog matches.")
+    help_parser.add_argument("--limit", type=int, default=20, help="Maximum local matches, 1-100.")
+    help_parser.add_argument("--offset", type=int, default=0, help="Pagination offset.")
+    help_parser.add_argument("--fetch", action="store_true", help="Request docs fetch metadata; Bridge currently returns links only.")
+    material_parser = subparsers.add_parser("material-info", help="Read material or shader node information.")
+    add_fields(material_parser)
+    material_parser.add_argument("--path", default=None, help="Specific material node path to inspect.")
+    material_parser.add_argument("--root", default="/mat", help="Root to scan when --path is not provided.")
+    material_parser.add_argument("--limit", type=int, default=100, help="Maximum material-like nodes to return, 1-500.")
+    multi_read_parser = subparsers.add_parser("multi-read", help="Run a bounded batch of safe read-only diagnostics.")
+    add_fields(multi_read_parser)
+    multi_read_parser.add_argument("path", help="JSON file containing a list of read steps.")
+    multi_read_parser.add_argument("--stop-on-error", action="store_true", help="Stop after the first failed read step.")
+    diagnostic_parser = subparsers.add_parser("diagnostic-bundle", help="Run a built-in safe read-only diagnostic preset.")
+    add_fields(diagnostic_parser)
+    diagnostic_parser.add_argument("preset", choices=("scene_overview", "node_debug", "render_readiness", "material_readiness"), nargs="?", default="scene_overview", help="Diagnostic preset.")
+    diagnostic_parser.add_argument("--path", default=None, help="Optional target node or network path.")
+    diagnostic_parser.add_argument("--root", default=None, help="Optional root network for scans.")
+    diagnostic_parser.add_argument("--stop-on-error", action="store_true", help="Stop the bundle after the first failed read step.")
+    panes_parser = subparsers.add_parser("list-panes", help="List visible Houdini panes.")
+    panes_parser.add_argument("--type", default=None, dest="pane_type", help="Optional pane type filter, such as NetworkEditor.")
+    pane_screenshot_parser = subparsers.add_parser("pane-screenshot", help="Capture a visible Houdini pane.")
+    pane_screenshot_parser.add_argument("--type", default="NetworkEditor", dest="pane_type", help="Pane type, such as NetworkEditor or Parm.")
+    pane_screenshot_parser.add_argument("--prefix", default="pane", help="Safe output filename prefix.")
+    pane_screenshot_parser.add_argument("--fit", action="store_true", help="Fit pane contents before capture when supported.")
+    multi_panes_parser = subparsers.add_parser("capture-multiple-panes", help="Capture several visible Houdini panes.")
+    multi_panes_parser.add_argument("--types", nargs="+", default=["NetworkEditor", "SceneViewer", "Parm"], help="Pane types to capture.")
+    multi_panes_parser.add_argument("--prefix", default="panes", help="Safe output filename prefix.")
+    multi_panes_parser.add_argument("--fit", action="store_true", help="Fit pane contents before capture when supported.")
+    network_screenshot_parser = subparsers.add_parser("network-screenshot", help="Capture a Network Editor pane for a node path.")
+    network_screenshot_parser.add_argument("--path", default="/obj", help="Network path to show before capture.")
+    network_screenshot_parser.add_argument("--prefix", default="network", help="Safe output filename prefix.")
+    network_screenshot_parser.add_argument("--no-fit", action="store_true", help="Do not fit network contents before capture.")
+    render_parser = subparsers.add_parser("render-info", help="Read render-related nodes and settings without rendering.")
+    add_fields(render_parser)
+    render_parser.add_argument("--root", default=None, help="Optional root network to scan. Defaults to /out, /stage, and /obj.")
+    render_parser.add_argument("--limit", type=int, default=100, help="Maximum render nodes, 1-200.")
+    render_parser.add_argument("--offset", type=int, default=0, help="Pagination offset.")
+    render_parser.add_argument("--no-parms", action="store_true", help="Omit full parameter details from render node results.")
+    scene_diff_parser = subparsers.add_parser("scene-diff", help="Compare two scene/network snapshot JSON files without contacting Houdini.")
+    scene_diff_parser.add_argument("before", help="Path to before JSON.")
+    scene_diff_parser.add_argument("after", help="Path to after JSON.")
+    scene_diff_parser.add_argument("--include-parms", action="store_true", help="Include parameter values when present in the input JSON.")
+    scene_diff_parser.add_argument("--max-changes", type=int, default=200, help="Maximum changes per section, 1-1000.")
     node_info_parser = subparsers.add_parser("node-info", help="Read one Houdini node.")
+    add_fields(node_info_parser)
     node_info_parser.add_argument("path", help="Absolute Houdini node path.")
     node_parms_parser = subparsers.add_parser("node-parms", help="Read parameters for one Houdini node.")
+    add_fields(node_parms_parser)
     node_parms_parser.add_argument("path", help="Absolute Houdini node path.")
+    node_parms_parser.add_argument("--parm-names", nargs="+", default=None, help="Only return named parameters.")
+    node_parms_parser.add_argument("--name-contains", default=None, help="Only return parameters whose name or label contains this text.")
+    node_parms_parser.add_argument("--limit", type=int, default=None, help="Maximum parameters to return, 1-1000.")
+    parameter_schema_parser = subparsers.add_parser("parameter-schema", help="Read parameter template metadata for one Houdini node.")
+    add_fields(parameter_schema_parser)
+    parameter_schema_parser.add_argument("path", help="Absolute Houdini node path.")
+    parameter_schema_parser.add_argument("--parm-names", nargs="+", default=None, help="Only return named parameters.")
+    parameter_schema_parser.add_argument("--name-contains", default=None, help="Only return parameters whose name or label contains this text.")
+    parameter_schema_parser.add_argument("--limit", type=int, default=None, help="Maximum parameters to return, 1-1000.")
+    parameter_schema_parser.add_argument("--no-defaults", action="store_true", help="Skip default value metadata.")
+    parameter_schema_parser.add_argument("--no-menu", action="store_true", help="Skip menu metadata.")
+    parameter_schema_parser.add_argument("--no-ranges", action="store_true", help="Skip range metadata.")
     screenshot_parser = subparsers.add_parser("viewport-screenshot", help="Capture the current Scene Viewer viewport.")
     screenshot_parser.add_argument("--width", type=int, default=1280, help="Screenshot width, 64-4096.")
     screenshot_parser.add_argument("--height", type=int, default=720, help="Screenshot height, 64-4096.")
@@ -70,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     downstream_parser = subparsers.add_parser("downstream", help="Trace output consumers for a node.")
     downstream_parser.add_argument("path", help="Absolute Houdini node path.")
     downstream_parser.add_argument("--depth", type=int, default=4, help="Traversal depth, 0-12.")
-    edit_mode_parser = subparsers.add_parser("edit-mode", help="Read or change the bridge edit gate.")
+    edit_mode_parser = subparsers.add_parser("edit-mode", help="Read the access mode or switch to read-only. Restore editing in the Houdini panel.")
     edit_mode_parser.add_argument("state", choices=("status", "on", "off"), help="Edit gate state.")
     create_parser = subparsers.add_parser("create-node", help="Create one node when bridge edit mode is enabled.")
     create_parser.add_argument("--parent", required=True, help="Parent network path.")
@@ -105,6 +187,11 @@ def main(argv: list[str] | None = None) -> int:
     set_parm_parser.add_argument("node", help="Node path.")
     set_parm_parser.add_argument("parm", help="Parameter name.")
     set_parm_parser.add_argument("value", help="JSON value, number, bool, or string.")
+    set_parm_expression_parser = subparsers.add_parser("set-parm-expression", help="Set a parameter expression when bridge edit mode is enabled.")
+    set_parm_expression_parser.add_argument("node", help="Node path.")
+    set_parm_expression_parser.add_argument("parm", help="Parameter name.")
+    set_parm_expression_parser.add_argument("expression", help="Single-line Houdini expression.")
+    set_parm_expression_parser.add_argument("--language", choices=("hscript", "python"), default="hscript", help="Expression language.")
     set_parm_any_parser = subparsers.add_parser("set-parm-any", help="Set the first existing parameter from candidates when edit mode is enabled.")
     set_parm_any_parser.add_argument("node", help="Node path.")
     set_parm_any_parser.add_argument("value", help="JSON value, number, bool, or string.")
@@ -135,6 +222,8 @@ def main(argv: list[str] | None = None) -> int:
     set_position_parser.add_argument("node", help="Node path.")
     set_position_parser.add_argument("x", type=float, help="Network editor X position.")
     set_position_parser.add_argument("y", type=float, help="Network editor Y position.")
+    set_frame_parser = subparsers.add_parser("set-frame", help="Set the current Houdini frame when bridge edit mode is enabled.")
+    set_frame_parser.add_argument("frame", type=float, help="Timeline frame.")
     ensure_parm_parser = subparsers.add_parser("ensure-parm", help="Create one simple spare parameter when edit mode is enabled.")
     ensure_parm_parser.add_argument("node", help="Node path.")
     ensure_parm_parser.add_argument("name", help="Parameter name.")
@@ -225,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
     workflow_review.add_argument("workflow_dir", help="Workflow directory containing plan.json.")
     workflow_run = workflow_subparsers.add_parser("run", help="Review, optionally enable edit mode, run, and collect evidence.")
     workflow_run.add_argument("workflow_dir", help="Workflow directory containing plan.json.")
-    workflow_run.add_argument("--enable-edit-mode", action="store_true", help="Explicitly allow workflow run to enable bridge edit mode.")
+    workflow_run.add_argument("--enable-edit-mode", action="store_true", help="Confirm that this workflow may edit an editable Houdini session.")
     workflow_run.add_argument("--evidence", choices=("minimal", "standard", "full"), default="standard", help="Evidence collection level after the run.")
     workflow_rollback = workflow_subparsers.add_parser("rollback", help="Draft rollback_plan.json from workflow evidence without executing it.")
     workflow_rollback.add_argument("workflow_dir", help="Workflow directory containing review/evidence artifacts.")
@@ -233,6 +322,26 @@ def main(argv: list[str] | None = None) -> int:
     workflow_report.add_argument("workflow_dir", help="Workflow directory to summarize.")
 
     args = parser.parse_args(argv)
+    if args.command == "job":
+        client = Connection(session_path=args.session, instance=args.instance)
+        if args.action == "list":
+            response = client.list_tasks()
+        elif args.action == "cancel":
+            response = client.cancel_task(args.job_id)
+        else:
+            response = client.task_status(args.job_id)
+        _print_json(response)
+        return 0 if response.get("ok") else 2
+    if args.command in {"instances", "connection", "diagnostics"}:
+        client = Connection(session_path=args.session, instance=args.instance)
+        if args.command == "instances":
+            response = {"ok": True, "instances": [auth.public_session(s) for s in auth.discover_sessions(args.session)]}
+        elif args.command == "diagnostics":
+            response = client.diagnostics()
+        else:
+            response = client.snapshot()
+        _print_json(response)
+        return 0 if response.get("ok", True) else 2
     if args.command == "doctor":
         response = _doctor(args.session)
         _print_json(response)
@@ -243,7 +352,30 @@ def main(argv: list[str] | None = None) -> int:
         _print_json(response)
         return 0 if response.get("ok") else 1
 
-    session = auth.load_session(args.session)
+    if args.command == "scene-diff":
+        payload = {
+            "before": _read_json(Path(args.before)),
+            "after": _read_json(Path(args.after)),
+            "include_parms": args.include_parms,
+            "max_changes": args.max_changes,
+        }
+        try:
+            protocol.validate_command("scene_diff", payload)
+            response = {"ok": True, "command": "scene_diff", "result": commands.scene_diff(payload)}
+        except Exception as exc:
+            response = {"ok": False, "command": "scene_diff", "error": {"code": "scene_diff_failed", "message": str(exc)}}
+        _print_json(response)
+        return 0 if response.get("ok") else 1
+
+    try:
+        # Explicit legacy descriptor paths remain supported. Default discovery
+        # must never select the last writer when multiple instances are alive.
+        session = (auth.load_session(args.session) if args.session and not args.instance else
+                   Connection(session_path=args.session, instance=args.instance)._resolve())
+    except ConnectionError as exc:
+        _print_json({"ok": False, "error": {"code": exc.code, "message": str(exc)},
+                     "candidates": exc.candidates})
+        return 2
     if session is None:
         _print_json(
             {
@@ -267,10 +399,62 @@ def main(argv: list[str] | None = None) -> int:
 
     command = _protocol_command(args.command)
     payload = {}
-    if command in {"node_info", "node_parms", "network", "upstream", "downstream"}:
+    if getattr(args, "fields", None):
+        payload["fields"] = args.fields
+    if command in {"node_info", "node_parms", "parameter_schema", "network", "upstream", "downstream"}:
         payload["path"] = args.path
+    if command in {"node_parms", "parameter_schema"}:
+        if args.parm_names:
+            payload["parm_names"] = args.parm_names
+        if args.name_contains:
+            payload["name_contains"] = args.name_contains
+        if args.limit is not None:
+            payload["limit"] = args.limit
+    if command == "parameter_schema":
+        payload["include_defaults"] = not args.no_defaults
+        payload["include_menu"] = not args.no_menu
+        payload["include_ranges"] = not args.no_ranges
     if command == "rpc_log":
         payload["limit"] = args.limit
+    if command == "list_node_types":
+        payload.update({"limit": args.limit, "offset": args.offset, "refresh": args.refresh})
+        if args.category:
+            payload["category"] = args.category
+        if args.name:
+            payload["name"] = args.name
+    if command == "get_houdini_help":
+        payload.update({"help_type": args.help_type, "item_name": args.item_name, "limit": args.limit, "offset": args.offset, "fetch": args.fetch})
+        if args.category:
+            payload["category"] = args.category
+    if command == "material_info":
+        payload.update({"root": args.root, "limit": args.limit})
+        if args.path:
+            payload["path"] = args.path
+    if command == "multi_read":
+        try:
+            payload["steps"] = _load_commands(args.path)
+            payload["continue_on_error"] = not args.stop_on_error
+        except Exception as exc:
+            _print_json(_batch_error("load_failed", str(exc)))
+            return 1
+    if command == "diagnostic_bundle":
+        payload.update({"preset": args.preset, "continue_on_error": not args.stop_on_error})
+        if args.path:
+            payload["path"] = args.path
+        if args.root:
+            payload["root"] = args.root
+    if command == "list_panes" and args.pane_type:
+        payload["type"] = args.pane_type
+    if command == "pane_screenshot":
+        payload.update({"type": args.pane_type, "prefix": args.prefix, "fit": args.fit})
+    if command == "capture_multiple_panes":
+        payload.update({"types": args.types, "prefix": args.prefix, "fit": args.fit})
+    if command == "network_screenshot":
+        payload.update({"path": args.path, "prefix": args.prefix, "fit": not args.no_fit})
+    if command == "render_info":
+        payload.update({"limit": args.limit, "offset": args.offset, "include_parms": not args.no_parms})
+        if args.root:
+            payload["root"] = args.root
     if command == "find_nodes":
         payload["root"] = args.root
         payload["limit"] = args.limit
@@ -287,6 +471,7 @@ def main(argv: list[str] | None = None) -> int:
     if command == "scene_snapshot":
         payload.update(
             {
+                "mode": args.mode,
                 "trace_depth": args.trace_depth,
                 "max_selected": args.max_selected,
                 "include_viewport": args.include_viewport,
@@ -343,6 +528,8 @@ def main(argv: list[str] | None = None) -> int:
             payload["color"] = args.color
     elif command == "set_parm":
         payload.update({"node": args.node, "parm": args.parm, "value": _parse_value(args.value)})
+    elif command == "set_parm_expression":
+        payload.update({"node": args.node, "parm": args.parm, "expression": args.expression, "language": args.language})
     elif command == "set_parm_any":
         payload.update({"node": args.node, "parms": args.parms, "value": _parse_value(args.value), "required": args.required})
     elif command == "batch_set_parms":
@@ -369,6 +556,8 @@ def main(argv: list[str] | None = None) -> int:
             payload["render"] = args.render == "on"
     elif command == "set_position":
         payload.update({"node": args.node, "x": args.x, "y": args.y})
+    elif command == "set_frame":
+        payload.update({"frame": args.frame})
     elif command == "ensure_parm":
         payload.update({"node": args.node, "name": args.name, "type": args.parm_type, "default": args.default})
         if args.label:
@@ -416,7 +605,7 @@ def main(argv: list[str] | None = None) -> int:
         payload.update({"node": args.node, "confirm": args.confirm, "delete_contents": args.delete_contents})
     elif command in {"layout", "select"}:
         payload["path"] = args.path
-    request = protocol.make_request(command, payload, token=session["token"])
+    request = _make_request(session, command, payload)
     response = _post(session["host"], session["port"], request, session["token"])
     _print_json(response)
     return 0 if response.get("ok") else 1
@@ -433,7 +622,7 @@ def _run_commands_file(session: dict, path: str, continue_on_error: bool = False
     for index, step in enumerate(steps):
         try:
             command, payload = _normalize_batch_step(step)
-            request = protocol.make_request(command, payload, token=session["token"])
+            request = _make_request(session, command, payload)
         except Exception as exc:
             response = {
                 "ok": False,
@@ -718,7 +907,7 @@ def _workflow_run(session: dict, workflow_dir: str, enable_edit_mode: bool = Fal
     if validation_result.get("blocked_by_edit_mode"):
         edit_response = _post_command(session, "edit_mode", {"enabled": True}, timings=timings, stage="edit_mode")
         if not edit_response.get("ok"):
-            response = _workflow_error("edit_mode_failed", "Could not enable bridge edit mode.")
+            response = _workflow_error("edit_mode_failed", "Houdini is read-only. Switch out of read-only mode in the Bridge panel.")
             response["edit_mode"] = edit_response
             _workflow_collect_after(session, root, evidence=evidence, timings=timings)
             response["performance"] = _performance_report(timings)
@@ -2121,7 +2310,7 @@ def _post_command(
     timings: list[dict] | None = None,
     stage: str | None = None,
 ) -> dict:
-    request = protocol.make_request(command, payload or {}, token=session["token"])
+    request = _make_request(session, command, payload or {})
     started = time.perf_counter()
     response = _post(session["host"], session["port"], request, session["token"])
     duration_ms = round((time.perf_counter() - started) * 1000, 3)
@@ -2623,7 +2812,7 @@ def _doctor(session_path: str | None = None, use_cache: bool = True) -> dict:
             "performance": _performance_report(timings),
         }
 
-    request = protocol.make_request("health", {}, token=session["token"])
+    request = _make_request(session, "health", {})
     health_started = time.perf_counter()
     health = _post(session["host"], session["port"], request, session["token"])
     timings.append({"stage": "rpc_health", "command": "health", "ok": bool(health.get("ok")), "duration_ms": round((time.perf_counter() - health_started) * 1000, 3)})
@@ -2716,47 +2905,36 @@ def _save_cached_health(session_path: str, session: dict, health: dict) -> None:
         pass
 
 
+def _make_request(session, command, payload):
+    request = protocol.make_request(command, payload, token=session["token"])
+    if session.get("generation"):
+        request.update(session_id=session["session_id"], generation=session["generation"])
+    return request
+
+
 def _post(host: str, port: int, payload: dict, token: str) -> dict:
-    url = "http://%s:%s/rpc" % (host, port)
-    data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "X-Blib-Bridge-Token": token,
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=5) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8")
-        try:
-            return json.loads(body)
-        except Exception:
-            return {
-                "ok": False,
-                "error": {
-                    "code": "http_error",
-                    "message": body or str(exc),
-                },
-            }
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error": {
-                "code": "connection_failed",
-                "message": str(exc),
-            },
-        }
+    session = {"host": host, "port": port, "token": token}
+    for key in ("session_id", "generation"):
+        if payload.get(key):
+            session[key] = payload[key]
+    client = Connection()
+    if session.get("generation"):
+        health = client._probe(session)
+        if not health.get("ok"):
+            return health
+    response = client._send(session, payload)
+    if response.get("pending"):
+        response = dict(response, ok=False, error={"code": "task_pending",
+            "message": "Task accepted and still pending. Query its job_id; do not repeat this write."})
+    return response
 
 
 def _protocol_command(cli_command: str) -> str:
     command = protocol.normalize_command(cli_command)
     if command == "status":
         return "health"
+    if command == "houdini_help":
+        return "get_houdini_help"
     return command
 
 

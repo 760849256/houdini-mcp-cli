@@ -25,6 +25,7 @@ Include these paths in a bridge-only source release:
 - `CONTRIBUTING.md`
 - `README.md`
 - `toolbar/Blib_Houdini_Bridge.shelf`
+- `icons/bridge.svg`
 - `scripts/python/blib_hou_bridge/`
 - `scripts/python/blib_hou_mcp/`
 - `scripts/python/blib_hou.py`
@@ -188,7 +189,7 @@ points to a concrete next action.
 | `session file missing` from `blib-hou doctor` | Houdini is not running, or the Bridge shelf server has not been started. | Start Houdini, open the `Blib Bridge` shelf, click `Bridge`, then rerun `blib-hou doctor`. |
 | RPC health fails after a valid session file | The saved session is stale, or the Houdini-side server stopped. | Click `Bridge` in Houdini to restart the server, then rerun `blib-hou doctor`. |
 | `token or authorization failure` | The CLI/MCP client is using an old session token. | Reread `%TEMP%\blib_hou_bridge\session.json`; do not paste or log the token. |
-| `edit mode` blocks a write | Bridge is intentionally read-only. | Review and validate the plan first, then enable `Edit On` from the shelf only for the intended write. |
+| `edit mode` blocks a write | Bridge is intentionally read-only. | Review and validate the plan first, then open the `Bridge` panel and enable editing only for the intended write. |
 | `workflow_review_blocked` or validation is not ready | The command list has missing paths, schema errors, or requires edit mode. | Read `review.json` and `validation.json`, fix `plan.json`, then rerun workflow review. |
 | `verification failed` | The post-run scene state does not match the reviewed plan. | Read `proof_report.json`, failed `verification.json` checks, and `rollback_plan.json` if present; draft a repair or rollback plan but do not auto-execute it. |
 | `evidence incomplete` | Required proof artifacts are missing. | Run `blib-hou workflow report <dir>` and collect the missing artifacts named in `evidence_checklist.json`. |
@@ -202,3 +203,23 @@ reports read mode before handing the scene back to artists.
 See `docs/COMPATIBILITY.md`. Windows with Houdini 21.0.440 is the first
 validated live-smoke environment. macOS, Linux, older Houdini versions, and
 public PyPI installation remain unvalidated until release notes say otherwise.
+
+独立 Bridge 包更新后，请重新运行 `python tools/install_houdini_package.py`，以更新 Houdini package 的搜索路径，然后重启 Houdini。独立安装仍使用 Blib Bridge Shelf；完整 Blib Tools 使用 Blib AI Shelf。
+
+## Connection candidate additions
+
+Include scripts/python/blib_hou_bridge/connection.py, docs/CONNECTION_RECOVERY.md,
+tests/test_connection_recovery.py and tools/acceptance_connection.py in the
+0.3.0a1 candidate. Follow the activation and limitations in CONNECTION_RECOVERY.md.
+The historical full-status check above is retained; routine connection probes
+should use blib-hou-mcp --connection or houdini://connection/current.
+
+## Endurance candidate
+
+From the Bridge root, use `python tools/build_bridge_candidate.py --output <new.zip> --extract-to <new-directory>`.
+Use the extracted directory for validation (`python tools/validate_bridge_release.py --public --strict`)
+and the isolated fault and endurance harnesses (`tools/acceptance_faults.py` and `tools/soak_bridge.py`).
+Keep the ZIP hash, the endurance report and its companion integration report together. The endurance
+report is marked `passed` after the mixed workload, recovery checks and fixture shutdown complete.
+For a rollback, restore the previously tested package path and start a fresh Houdini session.
+Finish or record any pending task IDs before changing versions; never replay an uncertain write.

@@ -4,5 +4,5 @@
             "BLIB_HOUDINI_BRIDGE": "__REPLACE_WITH_ABSOLUTE_BRIDGE_ROOT__"
         }
     ],
-    "path": "$BLIB_HOUDINI_BRIDGE"
+    "hpath": ["$BLIB_HOUDINI_BRIDGE", "$BLIB_HOUDINI_BRIDGE/standalone"]
 }

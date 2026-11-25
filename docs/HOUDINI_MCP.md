@@ -4,13 +4,193 @@
 It does not import `hou`; it reads the bridge session file and calls the
 existing `BlibHouBridge` RPC endpoint.
 
+## Everyday workflow
+
+The stdio adapter now defaults to **daily** mode: it advertises exactly six
+tools: `houdini_context`, `houdini_inspect`, `houdini_edit`, `houdini_execute`,
+`houdini_look`, and `houdini_job`. Start with context, make the edit, then look.
+Use `--tool-profile advanced` (or `BLIB_HOU_TOOL_PROFILE=advanced`) to advertise
+the full legacy tool collection. The underlying legacy calls remain compatible.
+Embedded Python callers retain the advanced constructor default; pass
+`BridgeMCPAdapter(tool_profile="daily")` for the six-tool list.
+
+- `houdini_context`: returns current network, selected nodes and a lightweight
+  `context_token` without evaluating geometry. Pass this token to edit when
+  operating on a previously inspected context.
+- `houdini_inspect`: default to a summary of selected nodes or current network
+  children. Use `root`, `query` and `limit` to scope the summary. Set
+  `parm_names` to read named values, `details: true` for full node details, or
+  `kind: errors` for errors and their direct input paths. Geometry inspection
+  requires `cook: true`.
+
+- `houdini_edit`: submit 1–100 ordinary edit steps in one request. Houdini
+  validates, applies and verifies the batch against the live context and
+  returns the applied-step count, changed paths and any failed check.
+  Add `preview` to return one inline image after verification. Use the job ID
+  to look up an interrupted submission.
+- `houdini_execute`: run custom Python in editable mode. Supply `inputs` as
+  JSON and read it as `bridge_inputs`. Assign a JSON value to `bridge_result`
+  to return structured `result.data`.
+  Defaults to waiting up to 10 seconds (maximum 30); longer jobs return their
+  UUID for `houdini_job`. A generated UUID is also returned on
+  an uncertain transport outcome. Reuse the UUID; never blindly resubmit.
+  `succeeded` means the Python finished, not that the visual task is correct.
+- `houdini_look`: returns inline images from viewport, camera, network, pane,
+  or both (viewport + network). Use `angles` for a front/right/top sheet and
+  `frames` for a labeled strip. Viewport, frame and network state are restored
+  after capture. The Houdini **预览** menu uses the same capture implementation.
+  If Houdini cannot provide network pane pixels, the result includes a labeled
+  graph drawn from the requested network's nodes and connections. Viewport requests default to 768 x 432; request
+  larger width/height for detail. `camera` temporarily looks through an object
+  camera and restores the previous camera, view and lock state. `target` frames
+  SOP/object geometry bounds and may cook; it does not change display flags.
+  Camera capture cannot be combined with target/alternate-view framing.
+  The tool does not start a render. A partial two-image capture retains the
+  successful image while reporting failure. Captures use visible tabs on the
+  current desktop, rather than a global first matching pane. All-black or
+  unreadable viewport previews are reported as unusable evidence, even when
+  the screenshot API successfully wrote a PNG.
+- `houdini_job`: reads the status of an existing Python UUID without resubmitting
+  it. Cancellation is not offered because arbitrary Python cannot safely be
+  interrupted through this bridge.
+
+Node fields in edit accept `@selected`, `@selected_parent`, `@network`, and
+suffixes such as `@selected_parent/OUT_PREVIEW`. An omitted `node` uses a single
+selection. An omitted creation parent uses that selection's parent, or the
+current network if nothing is selected. Multiple selections return candidates
+instead of guessing. Connection destinations must always be explicit. Look
+path/target/camera and inspect targets accept the same aliases.
+
+Changes of scene, selection or current network invalidate the context token;
+scene load/clear invalidates it even if the HIP filename stays the same.
+Reload the Houdini-side Bridge before using guarded edits: an older server
+without tokens is rejected instead of silently losing the guard.
+
+Example `houdini_edit` arguments (replace paths with inspected scene paths):
+
+```json
+{
+  "steps": [
+    {"command": "create_node", "payload": {"parent": "/obj/geo1", "type": "normal", "name": "normal_preview"}},
+    {"command": "create_node", "payload": {"parent": "/obj/geo1", "type": "null", "name": "OUT_PREVIEW"}},
+    {"command": "connect", "payload": {"src": "/obj/geo1/box1", "dst": "/obj/geo1/normal_preview", "input_index": 0}},
+    {"command": "connect", "payload": {"src": "/obj/geo1/normal_preview", "dst": "/obj/geo1/OUT_PREVIEW", "input_index": 0}},
+    {"command": "set_flags", "payload": {"node": "/obj/geo1/OUT_PREVIEW", "display": true}},
+    {"command": "layout", "payload": {"path": "/obj/geo1"}}
+  ]
+}
+```
+
+The default edit response contains impact, warnings, counts and failed or
+inconclusive checks; `details: true` includes the full run and verification.
+It does not cook geometry solely to prove visual quality. Follow with
+`houdini_look` when visual inspection is needed.
+
+Python, deletion and other advanced operations are excluded from `houdini_edit`.
+Plans requiring additional confirmations return `not_executed` with their
+review; use the existing advanced plan workflow for those. An execution or
+readback failure returns `needs_inspection` and may leave earlier steps applied.
+No automatic retry or rollback is performed. Use these tools within the user's
+authorized task. The **只读** switch blocks writes on the Houdini side.
+
+Restart the MCP client to load the new adapter tool list. Reload the Bridge
+code in Houdini to use the updated parameter review behavior there too.
+
+### Edit and capture in one call
+
+Add `"preview": {"mode": "viewport", "target": "@selected_parent/OUT_PREVIEW"}`
+to an edit request. `mode: camera` takes a `camera` path and
+`mode: network` takes a `path`. The host resolves aliases before the edit and
+captures after structural verification.
+
+Read `result.verified` and `result.preview.status` separately. An unavailable
+preview can accompany a verified edit. To fetch a saved image, call
+`houdini_job` with the edit's `job_id`. To capture again, call
+`houdini_job` with `action: preview` and the same edit ID. This read-only
+task captures the current state of the same live HIP using the original
+request. A different instance or a replaced HIP is rejected. If the preview
+task is pending, look it up with the separate preview task ID.
+
+### Parameterized Python example
+
+```json
+{
+  "code": "node = hou.node(bridge_inputs['path'])\nbridge_result = {'type': node.type().name()}",
+  "inputs": {"path": "/obj"}
+}
+```
+
+Pass this object to `houdini_execute`. A successful reply includes
+`structuredContent.result.data`. The same script can be reused with different
+arguments.
+
+### Verification of this iteration
+
+`tests/test_daily_workflow.py` covers tool profiles, implicit selection routing,
+ambiguous selections, stale contexts before and during execution, partial reads,
+and restoration after screenshot failures. Run `hython tools/acceptance_daily.py`
+in a separate process for real node-chain, parameter, connection-repair and
+error-diagnostic checks. This script refuses to run inside a live UI session.
+
+The four tasks passed in isolated Houdini 21.0.440 and 22.0.459 processes.
+Timing in the script measures in-process calls only, excluding model/network
+latency. On 2026-11-04 the live Houdini 22 connection was restored. The network
+image was visually inspected successfully; the viewport returned an all-black
+PNG despite reporting success. This exposed global/hidden pane selection and
+unreliable Python-wrapper identity deduplication in the pane inventory.
+Current-desktop visible-tab selection, stable desktop/name inventory keys, and
+black-image rejection were added. The actual captured black image was correctly
+classified using Houdini 22's image library. A Houdini-side Reload and repeat
+live viewport/camera/restoration checks remain required; these are not claimed
+as passed. Windows UI automation still timed out, so it could not perform the
+Reload itself. Mock restoration checks do not establish visual capture quality.
+
 ## Start Houdini First
 
 1. Open Houdini.
 2. Start the `Blib_hou_bridge` shelf tool.
-3. Enable edit mode only when you intend to allow scene writes.
+3. Bridge starts editable, including Python. Select **只读** in the panel for
+   an inspection and preview session.
+
+## Multiple Houdini instances
+
+Register the standard Blib Houdini Bridge MCP once. In each Houdini window,
+open **Bridge → 控制代码**. Each process starts with a random eight-character
+code. You can rename it, for example to GROOM-A or CACHE-B, and press **保存**.
+Codes are case-insensitive and unique across running Bridges.
+
+Press **复制给 AI** in each Houdini and paste into the corresponding AI chat.
+The AI calls houdini_context with control_code to confirm the HIP, then sends
+that code and the returned session_id as target_instance on subsequent calls.
+Calls share the same MCP entry and route independently. An unavailable code
+or mismatched instance rejects the request before sending it to a Houdini.
+Bridge stop/start in the same process keeps its code. A new Houdini process
+starts with a new random code.
+
+For a fixed MCP entry, **AI 接入** also offers an explicit Houdini process
+selection. The resulting --instance configuration only accepts that process.
 
 ## MCP Config
+
+Open **Bridge → AI 接入** to see the local Codex registration status and copy
+a config for Codex, Antigravity or another stdio MCP client. Select a Houdini
+instance to bind the exported config. **测试连接** launches the adapter and
+checks the MCP handshake and live host state. In Antigravity IDE,
+open **MCP Servers → Manage MCP Servers → View raw config** and merge the Bridge
+entry into the existing `mcpServers` object. See the
+[Antigravity MCP guide](https://antigravity.google/docs/ide-mcp).
+
+To generate the same formats from a terminal:
+
+```powershell
+blib-hou-mcp --print-client-config codex
+blib-hou-mcp --print-client-config antigravity
+blib-hou-mcp --print-client-config generic
+```
+
+MCP initialization includes onboarding instructions. Clients can read
+`houdini://adapter/about` even when Houdini is offline to discover the active
+tool and response profiles. For live health use `houdini://connection/current`.
 
 For Codex, the least error-prone setup is to let the bridge print the Codex CLI
 registration command:
@@ -121,9 +301,58 @@ planning edits. The bridge token is never printed.
 
 ## Exposed Tools
 
-Read tools include context, selection, scene snapshots, node search, node info,
-network traces, viewport screenshots, plan review, plan validation, plan
-verification, RPC log, and edit-mode status.
+Read tools include context, selection, scene snapshots, node search, node error
+scans, node info, parameter schema reads, geometry summaries, network traces,
+node type discovery, material/shader inspection, viewport screenshots, pane
+screenshots, multi-pane screenshots, Network Editor screenshots for node paths,
+pane listing, SideFX help-link lookup, render settings diagnostics, scene diffs,
+safe multi-read diagnostics, plan review, plan validation, plan verification,
+RPC log, and edit-mode status.
+`houdini_parameter_schema`, `houdini_geometry_summary`, and
+`houdini_find_error_nodes` are the first read-only diagnostics pack: they expose
+parameter template metadata, compact SOP geometry evidence, and current node
+errors or warnings without enabling bridge edit mode.
+`houdini_list_panes`, `houdini_pane_screenshot`, and
+`houdini_capture_multiple_panes`, and `houdini_network_screenshot` add visual
+diagnostics without allowing arbitrary output paths: captures are written only
+under the bridge temporary screenshots directory and should be treated as capture
+evidence, not proof of visual success unless a later human or visual-model review
+records a semantic verdict.
+`houdini_list_node_types` exposes a cached, paginated node type catalog for
+planning without guessing node names. `houdini_material_info` reads existing
+material/shader nodes and likely texture references but does not create or assign
+materials. `houdini_get_houdini_help` returns fixed SideFX documentation links and
+local node type catalog matches; it does not fetch web pages from Houdini.
+`houdini_render_info` reads render-related nodes and key settings such as camera,
+output path, renderer, resolution, frame range, and samples without rendering.
+`houdini_multi_read` batches a bounded list of safe read-only diagnostics in one
+bridge request. It intentionally excludes screenshot/file-capture tools, plan
+review/run tools, recursion, and all edit commands. Large-list diagnostics such
+as node type discovery, material info, render info, help lookup, node search,
+and error scans include `response_meta` with size, count, truncation, and
+pagination hints so clients can decide whether to request another page or narrow
+the query.
+Common read tools also accept a `fields` list for simple dot-path projection,
+for example `["path", "flags.display"]` on `houdini_node_info` or
+`["preset", "bundle.success_count"]` on `houdini_diagnostic_bundle`. Projection
+is a response-size optimization only; field strings are validated dot paths, not
+expressions.
+`houdini_scene_snapshot` also accepts `mode=full|routing|summary`. `full`
+preserves the legacy detailed snapshot, `routing` skips selected-node details
+and dependency traces while keeping scene semantics, and `summary` returns a
+compact context/network/risk summary. Use `routing` or `summary` for first-pass
+triage when a full proof bundle is not needed.
+`houdini_node_parms` and `houdini_parameter_schema` support `parm_names`,
+`name_contains`, and `limit` filters so clients can avoid evaluating every
+parameter on large nodes. `houdini_parameter_schema` can also skip defaults,
+menus, or ranges when only parameter names and current values are needed.
+`houdini_diagnostic_bundle` exposes built-in safe read presets:
+`scene_overview`, `node_debug`, `render_readiness`, and `material_readiness`.
+Each preset expands to a bounded `multi_read` plan and keeps the same exclusions
+for screenshots, plan tools, recursion, and edit commands.
+`houdini_scene_diff` compares two snapshot/network JSON payloads locally so
+clients can summarize before/after node and wiring changes without contacting
+Houdini.
 Bridge-backed MCP tools expose both `inputSchema` and `outputSchema`; bridge
 result schemas are used as the base, and MCP-local evidence annotations such as
 `mcp_preflight` and `mcp_postflight` are added where the adapter produces them.
@@ -176,6 +405,10 @@ execution instead of treating a non-error run as success. The local
 the same template catalog by risk domain, so clients can map
 `scene_routing.primary_risk_domain` to safe read tools, candidate templates, the
 required review flow, and evidence expectations before drafting a plan.
+Material create and material assign templates are intentionally plan-only: they
+generate `create-node`, `set-parm-any`, `connect`, and evidence-friendly layout
+steps, but clients must still review, validate, run, and verify before claiming
+that a material was created or assigned.
 
 CLI-generated workflow templates write the same draft contract into
 `template_provenance.json` and mirror it into `evidence_manifest.json`, using
@@ -336,3 +569,48 @@ The template catalog includes SOP cleanup, cache output, VDB, RBD, Vellum, Pyro,
 and `karma-solaris-preview`. The Karma/Solaris template creates a reviewable LOP
 network plan with SOP import, material library, Karma render settings, and USD
 render ROP setup, but it does not execute a render or save files.
+
+## Inline viewport and batched reads
+
+`houdini_viewport_screenshot` returns a PNG image content block in addition to the existing JSON path when the screenshot can be read locally. Only PNG files directly in the bridge screenshot directory, up to 8 MiB, are attached. If attachment fails, a text message is returned and the original path remains available. `houdini_multi_read` batches up to 20 existing read-only diagnostic calls; it does not accept edits, screenshots, or arbitrary Python.
+
+## Fast Python calls and viewport framing
+
+`houdini_python_submit` waits up to 600 ms by default and returns a completed
+job when possible; use `wait_ms` from 0 to 2000 to adjust. Longer jobs retain
+the same `job_id` and should be polled with `houdini_python_job_status`. A
+`timeout_unknown` response means a request may still have executed; do not
+repeat a write blindly. The ordinary RPC timeout remains five seconds.
+
+`houdini_viewport_screenshot` accepts `frame=current|selected|all`. The framed
+modes temporarily adjust the free viewport and restore its viewpoint after the
+capture, including on failure. Framing refuses viewports looking through or
+locked to a camera. A screenshot is evidence to inspect, not proof of quality.
+
+The MCP adapter also exposes `houdini_diagnostic_bundle` (scene overview, node
+debug, render readiness, and material readiness), `houdini_material_info`, and
+`houdini_render_info` for task-specific checks. These tools inspect current
+state; they do not render, assign materials, or judge image quality.
+
+
+## Focused inspection
+
+`houdini_geometry_summary` accepts `include_health=true` for a bounded polygon
+edge-incidence scan. It reports boundary, non-manifold and degenerate edges,
+normal attribute owners and whether inspection was complete. Open boundaries
+can be intentional; normal presence is not a normal-direction or quality test.
+The scan stops at 100,000 primitives or 300,000 edge occurrences and reports
+partial results explicitly; non-polygon primitives are counted as skipped.
+
+`houdini_viewport_screenshot` accepts `view=current|front|right|top` and an
+optional numeric `timeline_frame`. Repeat calls for multi-angle or multi-frame
+inspection. The original timeline frame and free viewport are restored, including
+on failure. View changes and auto-framing are refused for camera-linked views;
+`view=current` can capture an existing camera view. Switching frames may trigger
+cooking, and visual evidence still requires inspection.
+
+The Blib Bridge shelf has one `Bridge` button. It opens the control panel and
+starts the service when needed. The panel groups connection, edit and Python
+controls and shows their current states; detailed diagnostics can be expanded.
+Python execution remains separately gated and enabling it asks for confirmation.
+The former individual shelf tools are removed; use the control panel instead.

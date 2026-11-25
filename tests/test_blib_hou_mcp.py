@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 
@@ -41,6 +42,26 @@ class BridgeMCPAdapterTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), "BridgeMCPAdapter")
 
+    def test_adapter_self_description_is_available_offline_for_each_profile(self):
+        uri = "houdini://adapter/about"
+        for profile in ("daily", "advanced"):
+            with self.subTest(profile=profile):
+                load_session = Mock(side_effect=AssertionError("unexpected session lookup"))
+                post = Mock(side_effect=AssertionError("unexpected Houdini RPC"))
+                adapter = BridgeMCPAdapter(tool_profile=profile, response_profile="compact",
+                                           session_loader=load_session, poster=post)
+                init = adapter.handle_message({"method": "initialize", "id": 1})["result"]
+                self.assertIn(uri, init["instructions"])
+                resources = adapter.handle_message({"method": "resources/list", "id": 2})["result"]["resources"]
+                self.assertIn(uri, [resource["uri"] for resource in resources])
+                reply = adapter.handle_message({"method": "resources/read", "id": 3, "params": {"uri": uri}})
+                about = json.loads(reply["result"]["contents"][0]["text"])["result"]
+                self.assertEqual(about["tool_profile"], profile)
+                self.assertEqual(about["response_profile"], "compact")
+                self.assertEqual(about["tools"], [tool["name"] for tool in adapter.list_tools()])
+                load_session.assert_not_called()
+                post.assert_not_called()
+
     def test_initialize_lists_tools_and_resources(self):
         adapter = BridgeMCPAdapter(session_loader=lambda path=None: SESSION, poster=_ok_poster)
 
@@ -51,6 +72,9 @@ class BridgeMCPAdapterTests(unittest.TestCase):
         tool_names = {tool["name"] for tool in tools}
         self.assertIn("houdini_context", tool_names)
         self.assertIn("houdini_find_nodes", tool_names)
+        self.assertIn("houdini_find_error_nodes", tool_names)
+        self.assertIn("houdini_geometry_summary", tool_names)
+        self.assertIn("houdini_parameter_schema", tool_names)
         self.assertIn("houdini_scene_snapshot", tool_names)
         self.assertIn("houdini_set_comment", tool_names)
         self.assertIn("houdini_run_plan", tool_names)
@@ -110,13 +134,22 @@ class BridgeMCPAdapterTests(unittest.TestCase):
         self.assertIn("evidence_expectations", template_tool["outputSchema"]["properties"])
         self.assertIn("next_required_tools", template_tool["outputSchema"]["properties"])
         self.assertIn("workflow_policy", template_tool["_meta"]["resultSchema"]["properties"])
+        for command in ("context", "find_nodes", "find_error_nodes"):
+            schema = json.loads(json.dumps(
+                next(tool for tool in tools if tool["name"] == f"houdini_{command}")["inputSchema"]))
+            properties = schema["properties"]
+            for key in ("control_code", "target_instance"):
+                self.assertEqual(properties.pop(key)["type"], "string")
+            if command == "context":
+                self.assertEqual(properties.pop("instance")["type"], "string")
+            self.assertEqual(schema, protocol.command_manifest()["commands"][command]["payload_schema"])
         self.assertEqual(
-            next(tool for tool in tools if tool["name"] == "houdini_context")["inputSchema"],
-            protocol.command_manifest()["commands"]["context"]["payload_schema"],
+            next(tool for tool in tools if tool["name"] == "houdini_parameter_schema")["outputSchema"],
+            protocol.command_manifest()["commands"]["parameter_schema"]["result_schema"],
         )
         self.assertEqual(
-            next(tool for tool in tools if tool["name"] == "houdini_find_nodes")["inputSchema"],
-            protocol.command_manifest()["commands"]["find_nodes"]["payload_schema"],
+            next(tool for tool in tools if tool["name"] == "houdini_geometry_summary")["outputSchema"],
+            protocol.command_manifest()["commands"]["geometry_summary"]["result_schema"],
         )
         scene_tool = next(tool for tool in tools if tool["name"] == "houdini_scene_snapshot")
         self.assertIn("outputSchema", scene_tool)
@@ -683,7 +716,7 @@ class BridgeMCPAdapterTests(unittest.TestCase):
             if tool.get("name") == "houdini_set_comment":
                 tool["_meta"]["safety"]["requires_bridge_edit_mode"] = False
                 break
-        adapter.list_tools = lambda: tools
+        adapter.list_tools = lambda **kwargs: tools
 
         status = adapter.status(include_health=False)
 
@@ -710,7 +743,7 @@ class BridgeMCPAdapterTests(unittest.TestCase):
                     "success_criteria": [],
                 }
                 break
-        adapter.list_tools = lambda: tools
+        adapter.list_tools = lambda **kwargs: tools
 
         status = adapter.status(include_health=False)
 
@@ -749,6 +782,7 @@ class BridgeMCPAdapterTests(unittest.TestCase):
         self.assertEqual(status["scene_routing"]["error"]["code"], "snapshot_failed")
         self.assertEqual(status["readiness"]["primary_scene_risk_domain"], "unknown")
         self.assertIn("Scene routing snapshot is unavailable.", status["readiness"]["issues"])
+        self.assertIn("houdini_find_error_nodes", status["readiness"]["first_read_tools"])
         self.assertIn("houdini_rpc_log", status["readiness"]["first_read_tools"])
         self.assertEqual(status["client_bootstrap"]["action"], "recover_scene_routing")
         self.assertEqual(status["client_bootstrap"]["state"], "scene_routing_unavailable")
@@ -1941,6 +1975,40 @@ class BridgeMCPAdapterTests(unittest.TestCase):
         self.assertFalse(payload["success_gate"]["safe_to_run_direct_edits"])
         self.assertFalse(payload["success_gate"]["may_execute"])
         self.assertNotIn('"token":', output.getvalue())
+
+    def test_named_client_config_preserves_explicit_launch_options(self):
+        session_path = "C:/Temp/制作 🎬/session.json"
+        options = ["--tool-profile", "daily", "--response-profile", "compact",
+                   "--session", session_path, "--instance", "test-instance"]
+        name = "houdini_groom"
+        with _capture_stdout() as output:
+            self.assertEqual(main(["--print-client-config", "antigravity", "--server-name", name, *options]), 0)
+        entry = json.loads(output.getvalue())["mcpServers"][name]
+        self.assertEqual(entry["args"][1:], options)
+        self.assertEqual(set(entry), {"command", "args"})
+        try:
+            import tomllib
+        except ImportError:
+            return
+        with _capture_stdout() as output:
+            self.assertEqual(main(["--print-client-config", "codex", "--server-name", name, *options]), 0)
+        self.assertEqual(tomllib.loads(output.getvalue())["mcp_servers"][name], entry)
+
+    def test_pinned_exports_use_distinct_names(self):
+        result = {}
+        for instance in ("test-instance-A", "test-instance-B"):
+            with _capture_stdout() as output:
+                self.assertEqual(main(["--print-config", "--instance", instance]), 0)
+            for name, entry in json.loads(output.getvalue())["mcpServers"].items():
+                self.assertEqual(entry["args"][-2:], ["--instance", instance])
+                result[name] = instance
+        self.assertEqual(len(result), 2)
+
+    def test_named_client_config_rejects_missing_or_unknown_client(self):
+        for args in ([], ["unknown"], ["--print-config"]):
+            with self.subTest(args=args), patch("sys.stderr") as error:
+                self.assertEqual(main(["--print-client-config", *args]), 2)
+                error.write.assert_called_once()
 
     def test_cli_print_config_preserves_custom_session_path(self):
         session_path = "C:/Temp/blib_hou_bridge/custom-session.json"

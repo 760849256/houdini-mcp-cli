@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import socket
 import tempfile
 import time
+from contextlib import contextmanager
 from typing import Any
+from urllib.parse import quote
 
-from . import dynamics_profiles, history, protocol, recipes, state, workflow_templates
+from . import dynamics_profiles, execution, history, protocol, python_executor, recipes, state, workflow_templates
 
 
 class BridgeCommandError(RuntimeError):
@@ -18,21 +21,40 @@ class BridgeCommandError(RuntimeError):
 
 
 _PLAN_UNDO_DEPTH = 0
+_NODE_TYPE_CACHE_TTL_SECONDS = 300.0
+_NODE_TYPE_CACHE: dict[str, Any] = {"timestamp": 0.0, "items": []}
 
 
-def execute_in_houdini(command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Execute a bridge command on Houdini's main thread when available."""
+def execute_in_houdini(command: str, payload: dict[str, Any] | None = None,
+                       timings=None, before_execute=None) -> dict[str, Any]:
+    """Dispatch scene access with separately measured queue/execution time."""
+    queued_at = time.perf_counter()
+    def perform():
+        if before_execute is not None:
+            before_execute()
+        began = time.perf_counter()
+        if timings is not None:
+            timings["queue_ms"] = round((began - queued_at) * 1000, 3)
+        try:
+            return execute(command, payload)
+        finally:
+            if timings is not None:
+                timings["execute_ms"] = round((time.perf_counter() - began) * 1000, 3)
+    if command == "python_job_status":
+        return perform()
     try:
-        import hdefereval  # type: ignore
+        import hdefereval
     except ImportError:
-        return execute(command, payload)
-    return hdefereval.executeInMainThreadWithResult(lambda: execute(command, payload))
+        return perform()
+    return hdefereval.executeInMainThreadWithResult(perform)
 
 
 def execute(command: str, payload: dict[str, Any] | None = None, hou_module: Any | None = None) -> dict[str, Any]:
     command = protocol.normalize_command(command)
     payload = payload or {}
     protocol.validate_command(command, payload)
+    if command == "python_job_status":
+        return python_executor.status(payload["job_id"])
     if command == "health":
         return health()
     if command == "manifest":
@@ -42,29 +64,64 @@ def execute(command: str, payload: dict[str, Any] | None = None, hou_module: Any
     if command == "profile_manifest":
         return dynamics_profiles.manifest()
     if command == "rpc_log":
-        return rpc_log(payload)
+        return _project_response("rpc_log", rpc_log(payload), payload)
+    if command == "scene_diff":
+        return scene_diff(payload)
 
     hou = hou_module or _import_hou()
+    if command in {"edit_batch", "inspect_batch", "look_batch"}:
+        from . import workflows
+        function = {"edit_batch": workflows.edit, "inspect_batch": workflows.inspect, "look_batch": workflows.look}[command]
+        return function(hou, payload)
+    if command in {"edit_batch", "inspect_batch"}:
+        from . import workflows
+        return workflows.edit(hou, payload) if command == "edit_batch" else workflows.inspect(hou, payload)
     if command == "context":
-        return context(hou)
+        return _project_response("context", context(hou), payload)
+    if command == "diagnostic_bundle":
+        return diagnostic_bundle(hou, payload)
     if command == "selected":
-        return selected(hou)
+        return _project_response("selected", selected(hou), payload)
     if command == "scene_snapshot":
-        return scene_snapshot(hou, payload)
+        return _project_response("scene_snapshot", scene_snapshot(hou, payload), payload)
     if command == "find_nodes":
-        return find_nodes(hou, payload)
+        return _project_response("find_nodes", find_nodes(hou, payload), payload)
     if command == "node_info":
-        return node_info(hou, payload["path"])
+        return _project_response("node_info", node_info(hou, payload["path"], payload), payload)
     if command == "node_parms":
-        return node_parms(hou, payload["path"])
+        return _project_response("node_parms", node_parms(hou, payload["path"], payload), payload)
+    if command == "parameter_schema":
+        return _project_response("parameter_schema", parameter_schema(hou, payload["path"], payload), payload)
+    if command == "geometry_summary":
+        return _project_response("geometry_summary", geometry_summary(hou, payload["path"], payload.get("include_health", False)), payload)
+    if command == "get_houdini_help":
+        return _project_response("get_houdini_help", get_houdini_help(hou, payload), payload)
+    if command == "list_node_types":
+        return _project_response("list_node_types", list_node_types(hou, payload), payload)
+    if command == "material_info":
+        return _project_response("material_info", material_info(hou, payload), payload)
+    if command == "multi_read":
+        return _project_response("multi_read", multi_read(hou, payload), payload)
+    if command == "find_error_nodes":
+        return _project_response("find_error_nodes", find_error_nodes(hou, payload), payload)
+    if command == "list_panes":
+        return list_panes(hou, payload)
+    if command == "pane_screenshot":
+        return pane_screenshot(hou, payload)
+    if command == "capture_multiple_panes":
+        return capture_multiple_panes(hou, payload)
+    if command == "network_screenshot":
+        return network_screenshot(hou, payload)
+    if command == "render_info":
+        return _project_response("render_info", render_info(hou, payload), payload)
     if command == "viewport_screenshot":
         return viewport_screenshot(hou, payload)
     if command == "network":
-        return network(hou, payload["path"])
+        return _project_response("network", network(hou, payload["path"]), payload)
     if command == "upstream":
-        return upstream(hou, payload["path"], depth=payload.get("depth", 4))
+        return _project_response("upstream", upstream(hou, payload["path"], depth=payload.get("depth", 4)), payload)
     if command == "downstream":
-        return downstream(hou, payload["path"], depth=payload.get("depth", 4))
+        return _project_response("downstream", downstream(hou, payload["path"], depth=payload.get("depth", 4)), payload)
     if command == "edit_mode":
         return edit_mode(payload)
     if command == "validate_plan":
@@ -77,6 +134,10 @@ def execute(command: str, payload: dict[str, Any] | None = None, hou_module: Any
         return probe_parm_profile(hou, payload)
     if command in protocol.EDIT_COMMANDS and command != "run_plan":
         _require_edit_enabled(command)
+    if command == "python_submit":
+        if not state.python_enabled():
+            raise BridgeCommandError("Switch out of read-only mode in the Houdini Bridge panel.")
+        return python_executor.submit(payload["code"], payload["job_id"], hou, payload.get("inputs"))
     if command == "create_node":
         return create_node(hou, payload)
     if command == "rename_node":
@@ -91,6 +152,8 @@ def execute(command: str, payload: dict[str, Any] | None = None, hou_module: Any
         return create_sticky_note(hou, payload)
     if command == "set_parm":
         return set_parm(hou, payload)
+    if command == "set_parm_expression":
+        return set_parm_expression(hou, payload)
     if command == "set_parm_any":
         return set_parm_any(hou, payload)
     if command == "batch_set_parms":
@@ -105,6 +168,8 @@ def execute(command: str, payload: dict[str, Any] | None = None, hou_module: Any
         return set_flags(hou, payload)
     if command == "set_position":
         return set_position(hou, payload)
+    if command == "set_frame":
+        return set_frame(hou, payload)
     if command == "ensure_parm":
         return ensure_parm(hou, payload)
     if command == "connect":
@@ -141,6 +206,7 @@ def health() -> dict[str, Any]:
         "version": protocol.BRIDGE_VERSION,
         "commands": sorted(protocol.READ_COMMANDS | protocol.EDIT_COMMANDS),
         "edit_enabled": state.edit_enabled(),
+        "python_enabled": state.python_enabled(),
     }
 
 
@@ -161,6 +227,7 @@ def context(hou: Any) -> dict[str, Any]:
         "hip_path": hip_path,
         "hip_name": hip_name,
         "current_network": current_network,
+        "context_token": _context_token(hou),
         "selection": selection,
         "timeline": {
             "start": _safe_call(lambda: hou.playbar.frameRange()[0], default=None),
@@ -174,6 +241,17 @@ def context(hou: Any) -> dict[str, Any]:
     }
 
 
+def _context_token(hou: Any) -> str:
+    """Cheap identity check; never reads geometry or evaluates parameters."""
+    state.ensure_scene_events(hou)
+    def identity(node):
+        return [node.path(), _safe_node_method(node, "sessionId")]
+    value = [os.getpid(), state.scene_epoch(), hou.hipFile.path(),
+             _current_network_path(hou),
+             [identity(n) for n in hou.selectedNodes()]]
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def selected(hou: Any) -> dict[str, Any]:
     nodes = [_node_summary(node) for node in _safe_call(hou.selectedNodes, default=[])]
     return {
@@ -183,31 +261,33 @@ def selected(hou: Any) -> dict[str, Any]:
 
 
 def scene_snapshot(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    mode = str(payload.get("mode") or "full")
     ctx = context(hou)
     selected_result = selected(hou)
     network_path = payload.get("path") or ctx.get("current_network") or _selection_parent_path(selected_result) or "/obj"
-    trace_depth = int(payload.get("trace_depth", 1))
-    max_selected = int(payload.get("max_selected", 3))
+    trace_depth = int(payload.get("trace_depth", 1 if mode == "full" else 0))
+    max_selected = int(payload.get("max_selected", 3 if mode == "full" else 0))
 
     network_result = network(hou, network_path)
     selected_details = []
     traces = []
-    for summary in selected_result["nodes"][:max_selected]:
-        path = summary.get("path", "")
-        if not path:
-            continue
-        selected_details.append(node_info(hou, path))
-        if trace_depth > 0:
-            traces.append(
-                {
-                    "path": path,
-                    "upstream": upstream(hou, path, depth=trace_depth),
-                    "downstream": downstream(hou, path, depth=trace_depth),
-                }
-            )
+    if mode == "full":
+        for summary in selected_result["nodes"][:max_selected]:
+            path = summary.get("path", "")
+            if not path:
+                continue
+            selected_details.append(node_info(hou, path))
+            if trace_depth > 0:
+                traces.append(
+                    {
+                        "path": path,
+                        "upstream": upstream(hou, path, depth=trace_depth),
+                        "downstream": downstream(hou, path, depth=trace_depth),
+                    }
+                )
 
     viewport = {"included": False}
-    if payload.get("include_viewport", False):
+    if payload.get("include_viewport", False) and mode == "full":
         try:
             viewport = {
                 "included": True,
@@ -226,6 +306,45 @@ def scene_snapshot(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
 
     semantics = _scene_semantics(network_result, selected_result, traces, viewport)
 
+    summary = {
+        "mode": mode,
+        "network_path": network_result["path"],
+        "network_node_count": network_result["node_count"],
+        "selection_count": selected_result["count"],
+        "message_count": len(network_result.get("messages", [])),
+        "trace_count": len(traces),
+        "edit_enabled": state.edit_enabled(),
+        "inferred_purpose": semantics["inferred_purpose"],
+        "key_output_count": len(semantics["key_outputs"]),
+        "cache_node_count": len(semantics.get("cache_nodes", [])),
+        "simulation_node_count": len(semantics.get("simulation_nodes", [])),
+        "volume_node_count": len(semantics.get("volume_nodes", [])),
+        "render_node_count": len(semantics.get("render_nodes", [])),
+        "focus_candidate_count": len(semantics["focus_candidates"]),
+        "risk_count": len(semantics["risk_notes"]),
+        "risk_domain_count": len(semantics.get("risk_domains", [])),
+        "inspection_hint_count": len(semantics["inspection_hints"]),
+        "workflow_suggestion_count": len(semantics.get("workflow_suggestions", [])),
+    }
+    if mode == "summary":
+        return {
+            "context": ctx,
+            "selected": selected_result,
+            "network": {
+                "path": network_result["path"],
+                "node_count": network_result["node_count"],
+                "wire_count": len(network_result.get("wires", [])),
+                "message_count": len(network_result.get("messages", [])),
+            },
+            "semantics": {
+                "inferred_purpose": semantics["inferred_purpose"],
+                "primary_risk_domain": semantics.get("scene_understanding", {}).get("primary_risk_domain"),
+                "risk_domains": semantics.get("risk_domains", []),
+                "first_read_tools": semantics.get("scene_understanding", {}).get("first_read_tools", []),
+            },
+            "summary": summary,
+        }
+
     return {
         "context": ctx,
         "selected": selected_result,
@@ -234,25 +353,54 @@ def scene_snapshot(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
         "traces": traces,
         "viewport": viewport,
         "semantics": semantics,
+        "summary": summary,
+    }
+
+
+def scene_diff(payload: dict[str, Any]) -> dict[str, Any]:
+    before = payload.get("before", {})
+    after = payload.get("after", {})
+    include_parms = bool(payload.get("include_parms", False))
+    max_changes = int(payload.get("max_changes", 200))
+    before_nodes = _extract_diff_nodes(before, include_parms=include_parms)
+    after_nodes = _extract_diff_nodes(after, include_parms=include_parms)
+    before_paths = set(before_nodes)
+    after_paths = set(after_nodes)
+    added_paths = sorted(after_paths - before_paths)
+    removed_paths = sorted(before_paths - after_paths)
+    changed = []
+    for path in sorted(before_paths & after_paths):
+        node_changes = _node_diff(before_nodes[path], after_nodes[path], include_parms=include_parms)
+        if node_changes:
+            changed.append({"path": path, "changes": node_changes})
+    before_wires = _extract_diff_wires(before)
+    after_wires = _extract_diff_wires(after)
+    added_wires = sorted(after_wires - before_wires)
+    removed_wires = sorted(before_wires - after_wires)
+    total_changes = len(added_paths) + len(removed_paths) + len(changed) + len(added_wires) + len(removed_wires)
+    return {
         "summary": {
-            "network_path": network_result["path"],
-            "network_node_count": network_result["node_count"],
-            "selection_count": selected_result["count"],
-            "message_count": len(network_result.get("messages", [])),
-            "trace_count": len(traces),
-            "edit_enabled": state.edit_enabled(),
-            "inferred_purpose": semantics["inferred_purpose"],
-            "key_output_count": len(semantics["key_outputs"]),
-            "cache_node_count": len(semantics.get("cache_nodes", [])),
-            "simulation_node_count": len(semantics.get("simulation_nodes", [])),
-            "volume_node_count": len(semantics.get("volume_nodes", [])),
-            "render_node_count": len(semantics.get("render_nodes", [])),
-            "focus_candidate_count": len(semantics["focus_candidates"]),
-            "risk_count": len(semantics["risk_notes"]),
-            "risk_domain_count": len(semantics.get("risk_domains", [])),
-            "inspection_hint_count": len(semantics["inspection_hints"]),
-            "workflow_suggestion_count": len(semantics.get("workflow_suggestions", [])),
+            "before_node_count": len(before_nodes),
+            "after_node_count": len(after_nodes),
+            "added_node_count": len(added_paths),
+            "removed_node_count": len(removed_paths),
+            "changed_node_count": len(changed),
+            "added_wire_count": len(added_wires),
+            "removed_wire_count": len(removed_wires),
+            "total_change_count": total_changes,
         },
+        "nodes": {
+            "added": [after_nodes[path] for path in added_paths[:max_changes]],
+            "removed": [before_nodes[path] for path in removed_paths[:max_changes]],
+            "changed": changed[:max_changes],
+        },
+        "wires": {
+            "added": [_wire_from_key(key) for key in added_wires[:max_changes]],
+            "removed": [_wire_from_key(key) for key in removed_wires[:max_changes]],
+        },
+        "truncated": any(len(items) > max_changes for items in (added_paths, removed_paths, changed, added_wires, removed_wires)),
+        "max_changes": max_changes,
+        "include_parms": include_parms,
     }
 
 
@@ -276,7 +424,7 @@ def find_nodes(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
             matches.append(summary)
             if len(matches) >= limit:
                 break
-    return {
+    result = {
         "root": _safe_call(root.path, default=root_path),
         "count": len(matches),
         "visited": visited,
@@ -285,33 +433,356 @@ def find_nodes(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
         "filters": filters,
         "nodes": matches,
     }
+    return _with_response_meta("find_nodes", result, item_count=len(matches), total=len(matches), truncated=result["truncated"])
 
 
-def node_info(hou: Any, path: str) -> dict[str, Any]:
+def node_info(hou: Any, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     node = hou.node(path)
     if node is None:
         raise BridgeCommandError("Node not found: %s" % path)
-    return _node_details(node)
+    return _node_details(node, (payload or {}).get("fields"))
 
 
-def node_parms(hou: Any, path: str) -> dict[str, Any]:
+def node_parms(hou: Any, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     node = hou.node(path)
     if node is None:
         raise BridgeCommandError("Node not found: %s" % path)
-    parms = [_parm_details(parm) for parm in _safe_call(node.parms, default=[])]
+    payload = payload or {}
+    available = list(_safe_call(node.parms, default=[]))
+    filtered = _filter_parms(available, payload)
+    parms = [_parm_details(parm) for parm in filtered]
     return {
         "node": _node_summary(node),
         "parm_count": len(parms),
+        "available_parm_count": len(available),
+        "filters": _parm_filter_summary(payload),
         "parms": parms,
     }
 
 
-def viewport_screenshot(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+def parameter_schema(hou: Any, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    node = hou.node(path)
+    if node is None:
+        raise BridgeCommandError("Node not found: %s" % path)
+    payload = payload or {}
+    available = list(_safe_call(node.parms, default=[]))
+    filtered = _filter_parms(available, payload)
+    parameters = [
+        _parm_schema_details(
+            parm,
+            node,
+            include_defaults=payload.get("include_defaults", True),
+            include_menu=payload.get("include_menu", True),
+            include_ranges=payload.get("include_ranges", True),
+        )
+        for parm in filtered
+    ]
+    return {
+        "node": _node_summary(node),
+        "parameter_count": len(parameters),
+        "available_parameter_count": len(available),
+        "filters": _parm_filter_summary(payload),
+        "parameters": parameters,
+    }
+
+
+def geometry_summary(hou: Any, path: str, include_health: bool = False) -> dict[str, Any]:
+    node = hou.node(path)
+    if node is None:
+        raise BridgeCommandError("Node not found: %s" % path)
+    geo = _safe_node_geometry(node)
+    if geo is None:
+        raise BridgeCommandError("Geometry is not available for node: %s" % path)
+    result = {
+        "node": _node_summary(node),
+        "available": True,
+        "counts": _geo_counts(geo),
+        "bounds": _geo_bounds(geo),
+        "point_attributes": [_attrib_details(attrib) for attrib in _safe_call(geo.pointAttribs, default=[])],
+        "primitive_attributes": [_attrib_details(attrib) for attrib in _safe_call(geo.primAttribs, default=[])],
+        "vertex_attributes": [_attrib_details(attrib) for attrib in _safe_call(geo.vertexAttribs, default=[])],
+        "global_attributes": [_attrib_details(attrib) for attrib in _safe_call(geo.globalAttribs, default=[])],
+        "point_groups": [_group_details(group) for group in _safe_call(geo.pointGroups, default=[])],
+        "primitive_groups": [_group_details(group) for group in _safe_call(geo.primGroups, default=[])],
+    }
+
+    if include_health:
+        result["health"] = _geometry_health(hou, geo)
+    return result
+
+
+def _geometry_health(hou: Any, geo: Any, max_primitives: int = 100000, max_edges: int = 300000) -> dict[str, Any]:
+    """Inspect polygon edge incidence with bounded work; never treat a partial scan as complete."""
+    edges = {}
+    scanned = skipped = edge_count = 0
+    complete = True
+    reason = None
+    try:
+        iterator = geo.iterPrims()
+        polygon_type = hou.primType.Polygon
+        for prim in iterator:
+            if scanned + skipped >= max_primitives:
+                complete, reason = False, "primitive_limit"
+                break
+            if prim.type() != polygon_type:
+                skipped += 1
+                continue
+            vertices = prim.vertices()
+            count = len(vertices)
+            closed = prim.isClosed()
+            needed = count if closed and count > 1 else max(0, count - 1)
+            if edge_count + needed > max_edges:
+                complete, reason = False, "edge_limit"
+                break
+            points = [vertex.point().number() for vertex in vertices]
+            for index in range(needed):
+                edge = tuple(sorted((points[index], points[(index + 1) % count])))
+                edges[edge] = edges.get(edge, 0) + 1
+            edge_count += needed
+            scanned += 1
+    except Exception as exc:
+        complete, reason = False, "inspection_error: %s" % exc
+    attrs = {}
+    for owner, method in (("point", "pointAttribs"), ("vertex", "vertexAttribs"), ("primitive", "primAttribs")):
+        attrs[owner] = [str(_safe_call(a.name, default="")) for a in (_safe_call(getattr(geo, method, lambda: []), default=[]) or [])]
+    return {
+        "complete": complete,
+        "reason": reason,
+        "polygon_primitives_scanned": scanned,
+        "non_polygon_primitives_skipped": skipped,
+        "edge_occurrences_scanned": edge_count,
+        "boundary_edges": sum(value == 1 for value in edges.values()),
+        "non_manifold_edges": sum(value > 2 for value in edges.values()),
+        "degenerate_edges": sum(a == b for a, b in edges),
+        "normal_attribute_owners": [owner for owner, names in attrs.items() if "N" in names],
+        "interpretation": "Counts cover scanned polygons only; open boundaries can be intentional. Normal presence does not establish normal direction or quality.",
+    }
+
+
+def get_houdini_help(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    help_type = str(payload.get("help_type") or "node").lower()
+    item_name = str(payload.get("item_name") or "").strip()
+    category = str(payload.get("category") or "").strip()
+    limit = int(payload.get("limit", 20))
+    offset = int(payload.get("offset", 0))
+    docs = _houdini_docs_link(help_type, item_name)
+    matches = []
+    if help_type in {"node", "general"}:
+        catalog = _node_type_catalog(hou, refresh=False)
+        needle = item_name.lower()
+        category_filter = category.lower()
+        for item in catalog["items"]:
+            haystack = " ".join([str(item.get("name", "")), str(item.get("description", "")), str(item.get("category", ""))]).lower()
+            if needle and needle not in haystack:
+                continue
+            if category_filter and category_filter not in str(item.get("category", "")).lower():
+                continue
+            match = dict(item)
+            match["docs_url"] = _houdini_docs_link("node", str(item.get("name") or ""), str(item.get("category") or "")).get("url")
+            matches.append(match)
+    page, pagination = _paginate(matches, limit, offset)
+    result = {
+        "help_type": help_type,
+        "item_name": item_name,
+        "category": category or None,
+        "docs": docs,
+        "matches": page,
+        "pagination": pagination,
+        "fetch": {
+            "requested": bool(payload.get("fetch", False)),
+            "attempted": False,
+            "reason": "Bridge help is link-and-catalog only; it does not fetch web pages from Houdini.",
+            "allowed_domain": "sidefx.com",
+        },
+    }
+    return _with_response_meta("get_houdini_help", result, pagination=pagination, item_count=len(page), total=pagination["total"])
+
+
+def list_node_types(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    catalog = _node_type_catalog(hou, refresh=payload.get("refresh", False))
+    category_filter = str(payload.get("category") or "").lower()
+    name_filter = str(payload.get("name") or "").lower()
+    filtered = []
+    for item in catalog["items"]:
+        if category_filter and category_filter not in str(item.get("category", "")).lower():
+            continue
+        if name_filter and name_filter not in str(item.get("name", "")).lower() and name_filter not in str(item.get("description", "")).lower():
+            continue
+        filtered.append(item)
+    limit = int(payload.get("limit", 100))
+    offset = int(payload.get("offset", 0))
+    page, pagination = _paginate(filtered, limit, offset)
+    result = {
+        "total": len(filtered),
+        "count": len(page),
+        "offset": offset,
+        "limit": limit,
+        "has_more": pagination["has_more"],
+        "pagination": pagination,
+        "category": payload.get("category"),
+        "name": payload.get("name"),
+        "cache": {
+            "created_at": catalog["timestamp"],
+            "age_seconds": round(time.time() - float(catalog["timestamp"]), 3) if catalog["timestamp"] else None,
+            "ttl_seconds": _NODE_TYPE_CACHE_TTL_SECONDS,
+            "item_count": len(catalog["items"]),
+            "refreshed": bool(catalog.get("refreshed")),
+        },
+        "node_types": page,
+    }
+    return _with_response_meta("list_node_types", result, pagination=pagination, item_count=len(page), total=len(filtered))
+
+
+def material_info(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    path = payload.get("path")
+    if path:
+        node = hou.node(path)
+        if node is None:
+            raise BridgeCommandError("Material node not found: %s" % path)
+        result = {
+            "mode": "single",
+            "material": _material_details(node),
+        }
+        return _with_response_meta("material_info", result, item_count=1, total=1)
+    root_path = payload.get("root", "/mat")
+    root = hou.node(root_path)
+    if root is None:
+        raise BridgeCommandError("Material root not found: %s" % root_path)
+    limit = int(payload.get("limit", 100))
+    materials = []
+    visited = 0
+    for node in _walk_nodes(root):
+        visited += 1
+        if node is root:
+            continue
+        if _looks_like_material_node(node):
+            materials.append(_material_details(node, include_children=False))
+            if len(materials) >= limit:
+                break
+    result = {
+        "mode": "list",
+        "root": _safe_call(root.path, default=root_path),
+        "visited": visited,
+        "count": len(materials),
+        "limit": limit,
+        "truncated": len(materials) >= limit,
+        "materials": materials,
+    }
+    return _with_response_meta("material_info", result, item_count=len(materials), total=len(materials), truncated=result["truncated"])
+
+
+def multi_read(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    steps = payload.get("steps", [])
+    continue_on_error = bool(payload.get("continue_on_error", True))
+    results = []
+    success_count = 0
+    error_count = 0
+    stopped = False
+    for index, step in enumerate(steps):
+        execution.checkpoint()
+        command = protocol.normalize_command(step.get("command"))
+        step_payload = step.get("payload", {}) or {}
+        try:
+            result = execute(command, step_payload, hou_module=hou)
+            item = {
+                "index": index,
+                "command": command,
+                "ok": True,
+                "result": result,
+                "response_meta": _response_meta(command, result),
+            }
+            success_count += 1
+        except Exception as exc:
+            item = {
+                "index": index,
+                "command": command,
+                "ok": False,
+                "error": {
+                    "code": "read_failed",
+                    "message": str(exc),
+                },
+            }
+            error_count += 1
+            if not continue_on_error:
+                stopped = True
+                results.append(item)
+                break
+        results.append(item)
+    response = {
+        "ok": error_count == 0,
+        "count": len(results),
+        "requested_count": len(steps),
+        "success_count": success_count,
+        "error_count": error_count,
+        "stopped": stopped,
+        "continue_on_error": continue_on_error,
+        "allowed_commands": sorted(protocol.MULTI_READ_ALLOWED_COMMANDS),
+        "results": results,
+    }
+    return _with_response_meta("multi_read", response, item_count=len(results), total=len(steps), truncated=stopped)
+
+
+def diagnostic_bundle(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    preset = str(payload.get("preset") or "scene_overview")
+    steps = _diagnostic_steps(preset, payload)
+    bundle = multi_read(hou, {"steps": steps, "continue_on_error": payload.get("continue_on_error", True)})
+    target = {
+        "path": payload.get("path"),
+        "root": payload.get("root"),
+    }
+    response = {
+        "preset": preset,
+        "target": target,
+        "steps": steps,
+        "bundle": bundle,
+        "response_meta": _response_meta("diagnostic_bundle", bundle, item_count=bundle.get("count"), total=len(steps), truncated=bundle.get("stopped", False)),
+    }
+    return _project_response("diagnostic_bundle", response, payload)
+
+
+def find_error_nodes(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    root_path = payload["root"]
+    root = hou.node(root_path)
+    if root is None:
+        raise BridgeCommandError("Root node not found: %s" % root_path)
+    include_errors = payload.get("include_errors", True)
+    include_warnings = payload.get("include_warnings", True)
+    limit = int(payload.get("limit", 100))
+    matches = []
+    visited = 0
+    error_count = 0
+    warning_count = 0
+    for node in _walk_nodes(root):
+        visited += 1
+        errors = [str(item) for item in _safe_call(node.errors, default=[])] if include_errors else []
+        warnings = [str(item) for item in _safe_call(node.warnings, default=[])] if include_warnings else []
+        if errors or warnings:
+            error_count += len(errors)
+            warning_count += len(warnings)
+            matches.append({**_node_summary(node), "errors": errors, "warnings": warnings})
+            if len(matches) >= limit:
+                break
+    result = {
+        "root": _safe_call(root.path, default=root_path),
+        "count": len(matches),
+        "error_count": error_count,
+        "warning_count": warning_count,
+        "visited": visited,
+        "limit": limit,
+        "truncated": len(matches) >= limit,
+        "nodes": matches,
+    }
+    return _with_response_meta("find_error_nodes", result, item_count=len(matches), total=len(matches), truncated=result["truncated"])
+
+
+def viewport_screenshot(hou: Any, payload: dict[str, Any], *, _camera=None) -> dict[str, Any]:
+    if payload.get("camera"):
+        return _camera_screenshot(hou, payload)
     ui = getattr(hou, "ui", None)
     pane_type = getattr(getattr(hou, "paneTabType", None), "SceneViewer", None)
     if ui is None or pane_type is None:
         raise BridgeCommandError("Houdini UI Scene Viewer is not available.")
-    viewer = _safe_call(lambda: ui.paneTabOfType(pane_type), default=None)
+    viewer = _find_pane(hou, "SceneViewer")
     if viewer is None:
         raise BridgeCommandError("No Houdini Scene Viewer pane was found.")
     viewport = _safe_call(viewer.curViewport, default=None)
@@ -321,9 +792,20 @@ def viewport_screenshot(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
     width = int(payload.get("width", 1280))
     height = int(payload.get("height", 720))
     prefix = payload.get("prefix", "viewport")
-    directory = os.path.join(tempfile.gettempdir(), "blib_hou_bridge", "screenshots")
-    os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, "%s_%s.png" % (prefix, time.strftime("%Y%m%d_%H%M%S")))
+    path = _screenshot_path(prefix)
+
+    frame = payload.get("frame", "current")
+    view = payload.get("view", "current")
+    timeline_frame = payload.get("timeline_frame")
+    saved_frame = hou.frame() if timeline_frame is not None else None
+    saved_camera = None
+    saved_view_type = None
+    if frame != "current" or view != "current" or payload.get("target"):
+        if viewport.camera() is not None or viewport.isCameraLockedToView():
+            raise BridgeCommandError("Changing the viewport is unavailable while viewing through or locked to a camera; use the current view.")
+        saved_camera = viewport.defaultCamera().stash()
+        if view != "current":
+            saved_view_type = viewport.type()
 
     settings_func = getattr(viewport, "settings", None)
     settings = _safe_call(settings_func, default=None) if settings_func is not None else None
@@ -331,8 +813,25 @@ def viewport_screenshot(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
     if settings is not None and hasattr(settings, "resolution") and hasattr(settings, "setResolution"):
         saved_size = _safe_call(settings.resolution, default=None)
         _safe_call(lambda: settings.setResolution((width, height)), default=None)
-
     try:
+        if timeline_frame is not None:
+            hou.setFrame(timeline_frame)
+        if view != "current":
+            viewport.changeType(getattr(hou.geometryViewportType, {"front": "Front", "right": "Right", "top": "Top"}[view]))
+        if frame == "selected":
+            viewport.frameSelected()
+        elif frame == "all":
+            viewport.frameAll()
+        if payload.get("target"):
+            viewport.frameBoundingBox(_target_bounds(hou, payload["target"]))
+        if _camera is not None:
+            viewport.setCamera(_camera)
+            active = viewport.camera()
+            if active is None or active.path() != _camera.path():
+                raise BridgeCommandError("The Scene Viewer did not adopt the requested camera.")
+            viewport.lockCameraToView(True)
+        if _camera is not None or frame != "current" or view != "current" or timeline_frame is not None or payload.get("target"):
+            viewport.draw()
         if hasattr(viewport, "saveViewToImage"):
             viewport.saveViewToImage(path)
         elif hasattr(viewer, "saveViewToImage"):
@@ -342,8 +841,20 @@ def viewport_screenshot(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
         else:
             raise BridgeCommandError("This Houdini build does not expose a supported viewport screenshot API.")
     finally:
-        if settings is not None and saved_size is not None and hasattr(settings, "setResolution"):
-            _safe_call(lambda: settings.setResolution(saved_size), default=None)
+        try:
+            try:
+                if saved_view_type is not None:
+                    viewport.changeType(saved_view_type)
+            finally:
+                if saved_camera is not None:
+                    viewport.setDefaultCamera(saved_camera)
+        finally:
+            try:
+                if saved_frame is not None:
+                    hou.setFrame(saved_frame)
+            finally:
+                if settings is not None and saved_size is not None and hasattr(settings, "setResolution"):
+                    _safe_call(lambda: settings.setResolution(saved_size), default=None)
 
     if not os.path.exists(path):
         raise BridgeCommandError("Viewport screenshot did not create an image file.")
@@ -353,7 +864,473 @@ def viewport_screenshot(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
         "height": height,
         "bytes": os.path.getsize(path),
         "viewport": _safe_call(viewport.name, default=""),
+        "image_status": _viewport_image_status(path),
+        "view": view,
+        "timeline_frame": timeline_frame if timeline_frame is not None else _safe_call(lambda: hou.frame()),
+        "target": payload.get("target"),
     }
+
+
+def preview_sheet(captures, width, height):
+    try:
+        from PySide6 import QtCore, QtGui
+    except ImportError:
+        from PySide2 import QtCore, QtGui
+    columns = min(3, len(captures))
+    rows = (len(captures) + columns - 1) // columns
+    caption_height = 26
+    tile_height = height + caption_height
+    sheet = QtGui.QImage(columns * width, rows * tile_height, QtGui.QImage.Format_RGB32)
+    sheet.fill(QtGui.QColor("#222326"))
+    painter = QtGui.QPainter(sheet)
+    try:
+        painter.setPen(QtGui.QColor("#eeeeee"))
+        for index, capture in enumerate(captures):
+            x, y = (index % columns) * width, (index // columns) * tile_height
+            label = capture["label"]
+            if capture["ok"]:
+                image = QtGui.QImage(capture["result"]["path"])
+                if image.isNull():
+                    label += " · Image unavailable"
+                else:
+                    image = image.scaled(width, height, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                    painter.drawImage(x + (width - image.width()) // 2, y + (height - image.height()) // 2, image)
+            else:
+                label += " · Capture failed"
+            painter.drawText(QtCore.QRect(x + 8, y + height, width - 16, caption_height),
+                             QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, label)
+    finally:
+        painter.end()
+    path = _screenshot_path("preview-sheet")
+    if not sheet.save(path, "PNG"):
+        raise BridgeCommandError("Could not save the preview sheet.")
+    return {"path": path, "width": sheet.width(), "height": sheet.height(), "bytes": os.path.getsize(path)}
+
+
+def _viewport_image_status(path):
+    """Reject all-black previews as visual evidence; do not judge scene quality."""
+    for package in ("PySide6", "PySide2"):
+        try:
+            gui = __import__(package + ".QtGui", fromlist=["QImage"])
+            image = gui.QImage(path)
+            if image.isNull():
+                return "unreadable"
+            image = image.convertToFormat(gui.QImage.Format_RGB32)
+            data = image.constBits()
+            if hasattr(data, "setsize"):
+                data.setsize(image.sizeInBytes())
+            raw = memoryview(data).cast("B")
+            # RGB32 is B,G,R,A on the supported Windows host. Ignore alpha.
+            return "nonblack" if any(raw[0::4]) or any(raw[1::4]) or any(raw[2::4]) else "all_black"
+        except (ImportError, AttributeError, TypeError, ValueError):
+            continue
+    return "unchecked"
+
+
+def list_panes(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    ui = getattr(hou, "ui", None)
+    if ui is None:
+        raise BridgeCommandError("Houdini UI is not available.")
+    requested_type = payload.get("type")
+    current_desktop = _safe_call(lambda: ui.curDesktop(), default=None)
+    current_desktop_name = _safe_call(current_desktop.name, default="") if current_desktop is not None else ""
+    panes = []
+    seen: set[tuple[str, str]] = set()
+
+    desktops = list(_safe_call(lambda: ui.desktops(), default=[]) or [])
+    for desktop in desktops:
+        desktop_name = _safe_call(desktop.name, default="")
+        for pane in list(_safe_call(desktop.paneTabs, default=[]) or []):
+            # HOM may return short-lived Python wrappers whose id() is reused.
+            key = (desktop_name, _safe_call(pane.name, default=""))
+            if key in seen:
+                continue
+            seen.add(key)
+            summary = _pane_summary(pane, desktop_name, current_desktop_name)
+            if requested_type and summary.get("type") != requested_type:
+                continue
+            panes.append(summary)
+
+    if not panes:
+        for type_name in _available_pane_types(hou):
+            if requested_type and type_name != requested_type:
+                continue
+            pane_type = _pane_type(hou, type_name)
+            if pane_type is None:
+                continue
+            pane = _safe_call(lambda pt=pane_type: ui.paneTabOfType(pt), default=None)
+            key = (current_desktop_name, _safe_call(lambda: pane.name(), default=""))
+            if pane is None or key in seen:
+                continue
+            seen.add(key)
+            panes.append(_pane_summary(pane, current_desktop_name, current_desktop_name, fallback_type=type_name))
+
+    panes.sort(key=lambda item: (not item.get("capturable", False), item.get("type", ""), item.get("name", "")))
+    return {
+        "count": len(panes),
+        "capturable_count": sum(1 for pane in panes if pane.get("capturable")),
+        "current_desktop": current_desktop_name,
+        "available_types": _available_pane_types(hou),
+        "panes": panes,
+    }
+
+
+def pane_screenshot(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    pane_type_name = payload.get("type", "NetworkEditor")
+    pane = _find_pane(hou, pane_type_name)
+    if pane is None:
+        raise BridgeCommandError("No Houdini %s pane was found." % pane_type_name)
+    with _preserve_network_pane(pane, payload.get("restore", False) and payload.get("fit", False)):
+        if payload.get("fit", False):
+            _fit_pane(pane)
+        path = _screenshot_path(payload.get("prefix", "pane"))
+        if pane_type_name == "NetworkEditor":
+            return _capture_network_pane(pane, pane.pwd(), path)
+        source = _capture_pane_to_path(pane, path)
+        return dict(_pane_capture_result(pane, path, pane_type_name), capture_source=source)
+
+
+def capture_multiple_panes(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    types = payload.get("types") or ["NetworkEditor", "SceneViewer", "Parm"]
+    prefix = payload.get("prefix", "panes")
+    fit = bool(payload.get("fit", False))
+    results = []
+    success_count = 0
+    for pane_type_name in types:
+        try:
+            result = pane_screenshot(
+                hou,
+                {
+                    "type": pane_type_name,
+                    "prefix": "%s_%s" % (prefix, pane_type_name),
+                    "fit": fit,
+                },
+            )
+            result["ok"] = True
+            success_count += 1
+        except BridgeCommandError as exc:
+            result = {
+                "ok": False,
+                "pane_type": pane_type_name,
+                "error": str(exc),
+            }
+        results.append(result)
+    return {
+        "count": len(results),
+        "success_count": success_count,
+        "all_ok": success_count == len(results),
+        "results": results,
+    }
+
+
+def network_screenshot(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    node_path = payload.get("path", "/obj")
+    node = hou.node(node_path)
+    if node is None:
+        raise BridgeCommandError("Network not found: %s" % node_path)
+    pane = _find_pane(hou, "NetworkEditor")
+    if pane is None:
+        raise BridgeCommandError("No Houdini NetworkEditor pane was found.")
+    with _preserve_network_pane(pane, payload.get("restore", False)):
+        _navigate_network_pane(pane, node, node_path)
+        if pane.pwd().path() != node_path:
+            raise BridgeCommandError("Network Editor did not enter the requested network: " + node_path)
+        if payload.get("fit", True):
+            _fit_pane(pane)
+        if hasattr(pane, "redraw"):
+            pane.redraw()
+        path = _screenshot_path(payload.get("prefix", "network"))
+        return _capture_network_pane(pane, node, path)
+
+
+def _capture_network_pane(pane, node, path):
+    try:
+        source = _capture_pane_to_path(pane, path)
+        captured = _pane_capture_result(pane, path, "NetworkEditor")
+    except BridgeCommandError:
+        captured = {}
+    if captured.get("image_status") in {"all_black", "unreadable"} or not captured:
+        shown = _draw_network_graph(node, path)
+        captured = _pane_capture_result(pane, path, "NetworkEditor")
+        captured["shown_nodes"] = shown
+        source = "network_graph"
+    return dict(captured, capture_source=source, node_path=node.path(), child_count=len(node.children()))
+
+
+def _draw_network_graph(network_node, path):
+    """Render a bounded diagram from live graph data when pane pixels are unavailable."""
+    try:
+        from PySide6 import QtCore, QtGui
+    except ImportError:
+        from PySide2 import QtCore, QtGui
+
+    nodes = list(network_node.children())
+    selected = sorted(
+        nodes, key=lambda node: (
+            not _safe_node_method(node, "isDisplayFlagSet", False),
+            not _safe_node_method(node, "isSelected", False),
+            not (_safe_node_method(node, "inputs", ()) or _safe_node_method(node, "outputs", ())),
+        ),
+    )[:40]
+    nodes_by_path = {node.path(): node for node in selected}
+    dependencies = {}
+    for name, node in nodes_by_path.items():
+        dependencies[name] = [item.path() for item in _safe_node_method(node, "inputs", ())
+                              if item is not None and item.path() in nodes_by_path]
+    successors = {name: [] for name in nodes_by_path}
+    for name, inputs in dependencies.items():
+        for source in inputs:
+            successors[source].append(name)
+    connected = [name for name in nodes_by_path if dependencies[name] or successors[name]]
+
+    rank = {}
+    remaining = set(connected)
+    while remaining:
+        ready = [name for name in connected if name in remaining
+                 and all(parent not in remaining for parent in dependencies[name])]
+        if not ready:
+            ready = [name for name in connected if name in remaining]
+        for name in ready:
+            rank[name] = min(max((rank.get(parent, -1) + 1 for parent in dependencies[name]), default=0), 5)
+        remaining.difference_update(ready)
+
+    columns = max(4, max(rank.values(), default=0) + 1)
+    cell_w, cell_h = 177, 72
+    margin, header = 24, 68
+    positions = {}
+    column_rows = [0] * columns
+    for name in connected:
+        col = rank[name]
+        positions[name] = (margin + col * cell_w, header + column_rows[col] * cell_h)
+        column_rows[col] += 1
+    isolated = [name for name in nodes_by_path if name not in positions]
+    start = max(column_rows) + (1 if connected and isolated else 0)
+    for index, name in enumerate(isolated):
+        positions[name] = (margin + (index % columns) * cell_w, header + (start + index // columns) * cell_h)
+
+    rows = max(max(column_rows), start + (len(isolated) + columns - 1) // columns, 1)
+    width = margin * 2 + columns * cell_w
+    height = header + rows * cell_h + margin
+    image = QtGui.QImage(width, height, QtGui.QImage.Format_RGB32)
+    image.fill(QtGui.QColor("#26282c"))
+    painter = QtGui.QPainter(image)
+    try:
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.setFont(QtGui.QFont("Sans Serif", 11))
+        painter.setPen(QtGui.QColor("#f2f3f4"))
+        painter.drawText(margin, 25, network_node.path())
+        painter.setPen(QtGui.QColor("#b0b7c2"))
+        painter.drawText(margin, 48, f"Network graph · {len(selected)} / {len(nodes)} nodes")
+        painter.setPen(QtGui.QPen(QtGui.QColor("#7c9bbc"), 2))
+        box_w, box_h = cell_w - 23, cell_h - 24
+        for name, inputs in dependencies.items():
+            x, y = positions[name]
+            for source in inputs:
+                a, b = positions[source]
+                start_point = QtCore.QPointF(a + box_w, b + box_h / 2)
+                end_point = QtCore.QPointF(x, y + box_h / 2)
+                curve = QtGui.QPainterPath(start_point)
+                curve.cubicTo(start_point.x() + 20, start_point.y(),
+                              end_point.x() - 20, end_point.y(), end_point.x(), end_point.y())
+                painter.drawPath(curve)
+        for name, node in nodes_by_path.items():
+            x, y = positions[name]
+            border = "#78d6a2" if _safe_node_method(node, "isDisplayFlagSet", False) else "#596575"
+            painter.setPen(QtGui.QPen(QtGui.QColor(border), 1))
+            painter.setBrush(QtGui.QColor("#343a42"))
+            painter.drawRoundedRect(x, y, box_w, box_h, 5, 5)
+            painter.setPen(QtGui.QColor("#f5f6f7"))
+            metrics = painter.fontMetrics()
+            painter.drawText(x + 8, y + 19, metrics.elidedText(node.name(), QtCore.Qt.ElideRight, box_w - 16))
+            painter.setPen(QtGui.QColor("#b0b7c2"))
+            kind = node.type().name()
+            painter.drawText(x + 8, y + 37, metrics.elidedText(kind, QtCore.Qt.ElideRight, box_w - 16))
+    finally:
+        painter.end()
+    if not image.save(path, "PNG"):
+        raise BridgeCommandError("Could not save the network graph preview.")
+    return len(selected)
+
+
+@contextmanager
+def _preserve_network_pane(pane, enabled):
+    if not enabled:
+        yield
+        return
+    # Fail before navigation if this build cannot restore the editor.
+    previous = pane.pwd()
+    bounds = pane.visibleBounds()
+    try:
+        yield
+    finally:
+        try:
+            pane.setPwd(previous)
+        finally:
+            pane.setVisibleBounds(bounds, 0)
+
+
+def _camera_screenshot(hou, payload):
+    if payload.get("target") or payload.get("frame", "current") != "current" or payload.get("view", "current") != "current":
+        raise BridgeCommandError("Camera capture cannot be combined with target framing or alternate view.")
+    remaining = dict(payload)
+    camera_path = remaining.pop("camera")
+    requested_frame = remaining.pop("timeline_frame", None)
+    with _camera_view(hou, camera_path) as (viewer, viewport, camera):
+        if requested_frame is not None:
+            hou.setFrame(requested_frame)
+        return dict(viewport_screenshot(hou, remaining, _camera=camera), camera=camera.path())
+
+
+@contextmanager
+def _camera_view(hou, path):
+    camera = hou.node(path)
+    if camera is None or not hasattr(camera, "worldTransform"):
+        raise BridgeCommandError("Camera object not found: " + path)
+    viewer = _find_pane(hou, "SceneViewer")
+    if viewer is None:
+        raise BridgeCommandError("No Houdini Scene Viewer pane was found.")
+    viewport = viewer.curViewport()
+    previous = viewport.camera()
+    locked = viewport.isCameraLockedToView()
+    default = viewport.defaultCamera().stash()
+    view_type = viewport.type()
+    saved_frame = hou.frame()
+    try:
+        viewport.lockCameraToView(False)
+        yield viewer, viewport, camera
+    finally:
+        try:
+            viewport.lockCameraToView(False)
+            if hou.frame() != saved_frame:
+                hou.setFrame(saved_frame)
+            viewport.setCamera(None)
+            viewport.changeType(view_type)
+            viewport.setDefaultCamera(default)
+            if previous is not None:
+                viewport.setCamera(previous)
+        finally:
+            viewport.lockCameraToView(locked)
+            viewport.draw()
+
+
+def capture_camera_series(hou, payload, frames):
+    """Keep the camera bound to the viewer across one native flipbook operation."""
+    path = payload["camera"]
+    width, height = payload["width"], payload["height"]
+    ordered = sorted(set(frames))
+    interval = math.gcd(*(int(b - a) for a, b in zip(ordered, ordered[1:]))) or 1
+    same_grid = all(int(frame) == frame for frame in ordered)
+    sequence = same_grid and (ordered[-1] - ordered[0]) / interval < 24
+    files = {}
+    with _camera_view(hou, path) as (viewer, viewport, camera):
+        hou.setFrame(ordered[0])
+        viewport.setCamera(camera)
+        current = viewport.camera()
+        if current is None or current.path() != path:
+            raise BridgeCommandError("The Scene Viewer did not adopt the requested camera.")
+        viewport.lockCameraToView(True)
+        viewport.draw()
+        if sequence:
+            pattern = _screenshot_path("camera-strip")[:-4] + "-$F.png"
+            settings = _flipbook_options(viewer, pattern, width, height, (ordered[0], ordered[-1]))
+            settings.frameIncrement(interval)
+            viewer.flipbook(viewport, settings)
+            files = {frame: pattern.replace("$F", str(int(frame))) for frame in ordered}
+        else:
+            for frame in ordered:
+                execution.checkpoint()
+                image_path = _screenshot_path("camera-frame")
+                settings = _flipbook_options(viewer, image_path, width, height, (frame, frame))
+                viewer.flipbook(viewport, settings)
+                files[frame] = image_path
+
+    results = []
+    for frame in frames:
+        image_path = files[frame]
+        exists = os.path.isfile(image_path)
+        status = _viewport_image_status(image_path) if exists else "unreadable"
+        results.append({"path": image_path, "width": width, "height": height,
+                        "bytes": os.path.getsize(image_path) if exists else 0,
+                        "camera": path, "view": "camera", "image_status": status,
+                        "timeline_frame": frame,
+                        "summary": {"mode": "camera", "target": path, "view": "camera", "frame": frame}})
+    return results
+
+
+def _target_bounds(hou, path):
+    node = hou.node(path)
+    if node is None:
+        raise BridgeCommandError("Target not found: %s" % path)
+    if not hasattr(node, "geometry") and hasattr(node, "displayNode"):
+        node = node.displayNode()
+    if node is None or not hasattr(node, "geometry"):
+        raise BridgeCommandError("Target must be a SOP or a geometry object.")
+    geometry = node.geometry()  # Explicit target capture may cook this node.
+    parent = node.parent()
+    while parent is not None and not hasattr(parent, "worldTransform"):
+        parent = parent.parent()
+    transform = parent.worldTransform() if parent is not None else hou.hmath.identityTransform()
+    return geometry.boundingBox(transform=transform)
+
+
+def render_info(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    include_parms = bool(payload.get("include_parms", True))
+    limit = int(payload.get("limit", 100))
+    offset = int(payload.get("offset", 0))
+    explicit_root = payload.get("root")
+    root_paths = [explicit_root] if explicit_root else ["/out", "/stage", "/obj"]
+    roots = []
+    render_nodes = []
+    warnings = []
+    visited = 0
+    for root_path in root_paths:
+        if not root_path:
+            continue
+        root = hou.node(root_path)
+        if root is None:
+            warnings.append({"kind": "missing_root", "root": root_path})
+            continue
+        roots.append(_safe_call(root.path, default=root_path))
+        for node in _walk_nodes(root):
+            visited += 1
+            if node is root:
+                continue
+            if not _looks_like_render_node(node):
+                continue
+            render_nodes.append(_render_node_details(node, include_parms=include_parms))
+    page, pagination = _paginate(render_nodes, limit, offset)
+    output_paths = []
+    cameras = []
+    renderers = []
+    for item in render_nodes:
+        settings = item.get("settings", {})
+        output = settings.get("output_path")
+        camera = settings.get("camera")
+        renderer = settings.get("renderer")
+        if output:
+            output_paths.append(output)
+        if camera:
+            cameras.append(camera)
+        if renderer:
+            renderers.append(renderer)
+    result = {
+        "roots": roots,
+        "visited": visited,
+        "total": len(render_nodes),
+        "count": len(page),
+        "pagination": pagination,
+        "nodes": page,
+        "warnings": warnings,
+        "summary": {
+            "render_node_count": len(render_nodes),
+            "output_paths": _unique_paths([str(path) for path in output_paths]),
+            "cameras": _unique_paths([str(path) for path in cameras]),
+            "renderers": _unique_paths([str(value) for value in renderers]),
+            "missing_root_count": len([item for item in warnings if item.get("kind") == "missing_root"]),
+            "renders_executed": False,
+        },
+    }
+    return _with_response_meta("render_info", result, pagination=pagination, item_count=len(page), total=len(render_nodes))
 
 
 def network(hou: Any, path: str) -> dict[str, Any]:
@@ -409,9 +1386,12 @@ def downstream(hou: Any, path: str, depth: int = 4) -> dict[str, Any]:
 
 
 def edit_mode(payload: dict[str, Any]) -> dict[str, Any]:
-    if "enabled" in payload:
-        state.set_edit_enabled(payload["enabled"])
-    return {"edit_enabled": state.edit_enabled(), "mode": "edit" if state.edit_enabled() else "read"}
+    if payload.get("enabled") is False:
+        state.set_read_only(True)
+    elif payload.get("enabled") is True and not state.edit_enabled():
+        raise execution.TaskRejected("read_only", "Switch out of read-only mode in the Houdini Bridge panel.")
+    editable, python, _ = state.access_snapshot()
+    return {"edit_enabled": editable, "python_enabled": python, "mode": "edit" if editable else "read"}
 
 
 def validate_plan(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
@@ -519,7 +1499,20 @@ def verify_plan(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
         command = protocol.normalize_command(report.get("command"))
         payload_step = _verification_payload(report.get("payload", {}), aliases)
         step_result = _step_result(run_results, index)
-        checks.extend(_verify_plan_step(hou, index, command, payload_step, report, step_result, final_deleted_paths))
+        step_checks = _verify_plan_step(hou, index, command, payload_step, report, step_result, final_deleted_paths)
+        task = execution.current()
+        if task is not None:
+            observed = task.observations.get(index, {})
+            for position, check in enumerate(step_checks):
+                key = (check.get("path"), check.get("parm"))
+                evidence = observed.get(key) if check.get("kind") == "parm_value" else None
+                later = [i for i, items in task.observations.items()
+                         if i > index and key in items and evidence is not None
+                         and items[key]["node_id"] == evidence["node_id"]]
+                if evidence is not None and later:
+                    step_checks[position] = dict(evidence["check"], scope="intermediate_readback",
+                                                 superseded_by=max(later))
+        checks.extend(step_checks)
         for old_path, new_path in (report.get("aliases", {}) or {}).items():
             if isinstance(old_path, str) and isinstance(new_path, str):
                 aliases[old_path] = new_path
@@ -1240,6 +2233,49 @@ def set_parm(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
     return _with_undo(hou, "Blib Bridge set parm", _action)
 
 
+def _validate_parm_expression(expression: str) -> None:
+    if "\n" in expression or "\r" in expression:
+        raise BridgeCommandError("Parameter expressions must be single-line.")
+    blocked = ("`", ";", "system(", "exec(", "open(", "save", "load", "python", "hou.")
+    lowered = expression.lower()
+    for token in blocked:
+        if token in lowered:
+            raise BridgeCommandError("Blocked unsafe expression token: %s" % token)
+
+
+def set_parm_expression(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    node = _require_node(hou, payload["node"], "Node not found")
+    parm_name = payload["parm"]
+    parm = node.parm(parm_name)
+    if parm is None:
+        raise BridgeCommandError("Parameter not found: %s/%s" % (payload["node"], parm_name))
+    expression = str(payload["expression"])
+    _validate_parm_expression(expression)
+    language_name = payload.get("language", "hscript")
+    language = hou.exprLanguage.Hscript if language_name == "hscript" else hou.exprLanguage.Python
+
+    def _action():
+        parm.setExpression(expression, language=language)
+        return {
+            "touched": [_safe_call(node.path, default=payload["node"])],
+            "parm": parm_name,
+            "expression": expression,
+            "language": language_name,
+        }
+
+    return _with_undo(hou, "Blib Bridge set parm expression", _action)
+
+
+def set_frame(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    frame = float(payload["frame"])
+
+    def _action():
+        hou.setFrame(frame)
+        return {"frame": hou.frame(), "time": hou.time()}
+
+    return _with_undo(hou, "Blib Bridge set frame", _action)
+
+
 def set_parm_any(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
     node = _require_node(hou, payload["node"], "Node not found")
     parms = list(payload.get("parms") or [])
@@ -1344,11 +2380,16 @@ def probe_parm_profile(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
     return resolved
 
 
-def run_plan(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
+def run_plan(hou: Any, payload: dict[str, Any], _validation=None) -> dict[str, Any]:
+    expected_context = payload.get("expected_context")
+    if expected_context and expected_context != _context_token(hou):
+        raise BridgeCommandError("Scene, network or selection changed. Read context again before editing; no steps executed.")
     steps = payload.get("steps", []) or []
     continue_on_error = bool(payload.get("continue_on_error", False))
     undo_label = payload.get("undo_label") or "Blib Bridge plan"
-    validation = validate_plan(hou, payload)
+    validation = _validation if _validation is not None else validate_plan(hou, payload)
+    if expected_context and not validation.get("ready_to_run"):
+        raise BridgeCommandError("Guarded edit no longer validates; no steps executed. Inspect the current scene.")
     order_issues = []
     for report in validation.get("steps", []) or []:
         if report.get("command") != "create_network_box":
@@ -1371,12 +2412,15 @@ def run_plan(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
         _PLAN_UNDO_DEPTH += 1
         try:
             for index, step in enumerate(steps):
+                execution.checkpoint()
                 step_started = time.time()
                 try:
                     command = protocol.normalize_command(step.get("command"))
                     step_payload = step.get("payload", {}) or {}
                     if command == "run_plan":
                         raise BridgeCommandError("run_plan cannot contain nested run_plan steps.")
+                    if command in protocol.EDIT_COMMANDS:
+                        execution.start_effects()
                     result = execute(command, step_payload, hou_module=hou)
                     response = {
                         "ok": True,
@@ -1385,6 +2429,15 @@ def run_plan(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
                         "error": None,
                         "duration_ms": round((time.time() - step_started) * 1000, 3),
                     }
+                    task = execution.current()
+                    if task is not None and command in {"set_parm", "batch_set_parms"}:
+                        observation = {}
+                        for check in _verify_plan_step(hou, index, command, step_payload, {}, response, set()):
+                            if check.get("kind") == "parm_value":
+                                node = hou.node(check["path"])
+                                observation[(check["path"], check["parm"])] = {
+                                    "check": check, "node_id": _safe_node_method(node, "sessionId")}
+                        task.observations[index] = observation
                 except Exception as exc:
                     ok = False
                     response = {
@@ -1396,6 +2449,7 @@ def run_plan(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
                     }
                     failed_step = {"index": index, "command": response["command"], "error": response["error"]}
                 results.append({"index": index, "response": response})
+                execution.progress(len(results), len(steps), {"ran": len(results), "results": list(results)})
                 if not response["ok"] and not continue_on_error:
                     break
         finally:
@@ -1640,10 +2694,10 @@ def replace_node(hou: Any, payload: dict[str, Any]) -> dict[str, Any]:
         new_node = parent.createNode(node_type, node_name=name) if name else parent.createNode(node_type)
         if reconnect_inputs:
             for item in input_connections:
-                _set_input(new_node, item["input_index"], item["src"])
+                _set_input(new_node, item["input_index"], item["src"], item.get("output_index", 0))
         if reconnect_outputs:
             for item in output_connections:
-                _set_input(item["dst"], item["input_index"], new_node)
+                _set_input(item["dst"], item["input_index"], new_node, item.get("output_index", 0))
         deleted = None
         if delete_old:
             _destroy_node(old_node)
@@ -1715,11 +2769,22 @@ def select(hou: Any, path: str) -> dict[str, Any]:
 
 
 def _capture_flipbook(hou: Any, viewer: Any, path: str, width: int, height: int) -> None:
+    frame = hou.frame()
+    viewer.flipbook(viewer.curViewport(), _flipbook_options(viewer, path, width, height, (frame, frame)))
+
+
+def _flipbook_options(viewer, path, width, height, frame_range):
     settings = viewer.flipbookSettings().stash()
     settings.output(path)
-    settings.frameRange((hou.frame(), hou.frame()))
+    settings.outputToMPlay(False)
+    settings.frameRange(frame_range)
+    settings.frameIncrement(1)
+    settings.renderAllViewports(False)
+    settings.leaveFrameAtEnd(False)
+    settings.useResolution(True)
     settings.resolution((width, height))
-    viewer.flipbook(viewer.curViewport(), settings)
+    settings.initializeSimulations(False)
+    return settings
 
 
 def _import_hou() -> Any:
@@ -1757,14 +2822,21 @@ def _input_at(node: Any, input_index: int) -> Any | None:
     return inputs[input_index]
 
 
-def _set_input(dst: Any, input_index: int, src: Any | None) -> None:
+def _set_input(dst: Any, input_index: int, src: Any | None, output_index: int = 0) -> None:
     try:
-        dst.setInput(input_index, src)
+        dst.setInput(input_index, src, output_index)
     except TypeError:
-        dst.setInput(input_index, src, 0)
+        if output_index:
+            raise
+        dst.setInput(input_index, src)
 
 
 def _input_connections(node: Any) -> list[dict[str, Any]]:
+    if hasattr(node, 'inputConnections') and all(hasattr(c, 'inputItemOutputIndex') for c in node.inputConnections()):
+        return [{"src": c.inputItem(), "src_path": _node_path(c.inputItem(), ""),
+                 "dst": node, "dst_path": _node_path(node, ""),
+                 "input_index": c.inputIndex(), "output_index": c.inputItemOutputIndex()}
+                for c in node.inputConnections()]
     connections = []
     for input_index, src in enumerate(_safe_call(node.inputs, default=[])):
         if src is None:
@@ -1782,6 +2854,11 @@ def _input_connections(node: Any) -> list[dict[str, Any]]:
 
 
 def _output_connections(node: Any) -> list[dict[str, Any]]:
+    if hasattr(node, 'outputConnections') and all(hasattr(c, 'inputItemOutputIndex') for c in node.outputConnections()):
+        return [{"src": node, "src_path": _node_path(node, ""),
+                 "dst": c.outputItem(), "dst_path": _node_path(c.outputItem(), ""),
+                 "input_index": c.inputIndex(), "output_index": c.inputItemOutputIndex()}
+                for c in node.outputConnections()]
     node_path = _node_path(node, "")
     connections = []
     for dst in _safe_call(node.outputs, default=[]):
@@ -1798,6 +2875,574 @@ def _output_connections(node: Any) -> list[dict[str, Any]]:
                     }
                 )
     return connections
+
+
+def _node_type_catalog(hou: Any, refresh: bool = False) -> dict[str, Any]:
+    now = time.time()
+    if (
+        not refresh
+        and _NODE_TYPE_CACHE["items"]
+        and now - float(_NODE_TYPE_CACHE.get("timestamp", 0.0)) < _NODE_TYPE_CACHE_TTL_SECONDS
+    ):
+        return {"timestamp": _NODE_TYPE_CACHE["timestamp"], "items": list(_NODE_TYPE_CACHE["items"]), "refreshed": False}
+    categories = _safe_call(hou.nodeTypeCategories, default={}) or {}
+    items = []
+    for category_name, category in sorted(categories.items(), key=lambda item: str(item[0]).lower()):
+        node_types = _safe_call(category.nodeTypes, default={}) or {}
+        for type_name, node_type in sorted(node_types.items(), key=lambda item: str(item[0]).lower()):
+            description = _safe_call(node_type.description, default="")
+            source_path = _safe_call(lambda nt=node_type: nt.sourcePath(), default="")
+            items.append(
+                {
+                    "name": str(type_name),
+                    "category": str(category_name),
+                    "description": str(description or ""),
+                    "source_path": str(source_path or ""),
+                }
+            )
+    _NODE_TYPE_CACHE["timestamp"] = now
+    _NODE_TYPE_CACHE["items"] = items
+    return {"timestamp": now, "items": list(items), "refreshed": True}
+
+
+def _looks_like_material_node(node: Any) -> bool:
+    summary = _node_summary(node)
+    text = " ".join([summary.get("path", ""), summary.get("name", ""), summary.get("type", ""), summary.get("category", "")]).lower()
+    terms = (
+        "material",
+        "shader",
+        "principled",
+        "mtlx",
+        "redshift",
+        "arnold",
+        "karma",
+        "usdpreview",
+    )
+    return any(term in text for term in terms)
+
+
+def _material_details(node: Any, include_children: bool = True) -> dict[str, Any]:
+    parms = [_parm_details(parm) for parm in _safe_call(node.parms, default=[])]
+    child_nodes = [_node_summary(child) for child in _safe_call(node.children, default=[])] if include_children else []
+    texture_paths = _likely_texture_paths(parms)
+    return {
+        "node": _node_summary(node),
+        "parm_count": len(parms),
+        "parms": parms[:200],
+        "texture_paths": texture_paths,
+        "texture_count": len(texture_paths),
+        "children": child_nodes[:200],
+        "child_count": len(child_nodes),
+    }
+
+
+def _likely_texture_paths(parms: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    texture_exts = (".exr", ".hdr", ".tx", ".rat", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".tga")
+    results = []
+    for parm in parms:
+        raw = parm.get("raw_value")
+        value = parm.get("value")
+        text = raw if isinstance(raw, str) else value if isinstance(value, str) else ""
+        lowered = text.lower()
+        if not text:
+            continue
+        name = str(parm.get("name", "")).lower()
+        if any(ext in lowered for ext in texture_exts) or "texture" in name or "map" in name or "file" in name:
+            results.append({"parameter": parm.get("name", ""), "value": text})
+    return results
+
+
+def _looks_like_render_node(node: Any) -> bool:
+    summary = _node_summary(node)
+    text = " ".join([summary.get("path", ""), summary.get("name", ""), summary.get("type", ""), summary.get("category", "")]).lower()
+    terms = (
+        "rop",
+        "render",
+        "karma",
+        "mantra",
+        "redshift",
+        "arnold",
+        "renderman",
+        "usd",
+        "lop",
+        "renderproduct",
+        "rendersettings",
+    )
+    return any(term in text for term in terms)
+
+
+def _render_node_details(node: Any, include_parms: bool = True) -> dict[str, Any]:
+    parms = [_parm_details(parm) for parm in _safe_call(node.parms, default=[])]
+    settings = _render_settings_from_parms(parms)
+    details = {
+        "node": _node_summary(node),
+        "settings": settings,
+        "warnings": [str(item) for item in _safe_call(node.warnings, default=[])],
+        "errors": [str(item) for item in _safe_call(node.errors, default=[])],
+    }
+    if include_parms:
+        details["parm_count"] = len(parms)
+        details["parms"] = parms[:200]
+        details["parms_truncated"] = len(parms) > 200
+    return details
+
+
+def _render_settings_from_parms(parms: list[dict[str, Any]]) -> dict[str, Any]:
+    candidates = {
+        "camera": ("camera", "camerapath", "cam", "cameraprim"),
+        "output_path": ("picture", "vm_picture", "sopoutput", "outputimage", "renderproduct", "productname", "lopoutput", "usdfile"),
+        "renderer": ("renderer", "renderengine", "engine", "delegate"),
+        "frame_range": ("f1", "f2", "f3", "trange"),
+        "resolution_x": ("resx", "resolutionx", "xres"),
+        "resolution_y": ("resy", "resolutiony", "yres"),
+        "samples": ("samples", "primarysamples", "pixelsamples", "aa_samples", "karma_samples"),
+    }
+    settings: dict[str, Any] = {}
+    values_by_name = {str(parm.get("name") or "").lower(): parm.get("value") for parm in parms}
+    raw_by_name = {str(parm.get("name") or "").lower(): parm.get("raw_value") for parm in parms}
+    for setting, names in candidates.items():
+        if setting == "frame_range":
+            frames = {}
+            for name in names:
+                if name in values_by_name:
+                    frames[name] = values_by_name.get(name)
+            if frames:
+                settings[setting] = frames
+            continue
+        for name in names:
+            if name in values_by_name:
+                value = values_by_name.get(name) if setting in {"resolution_x", "resolution_y", "samples"} else raw_by_name.get(name)
+                if value in (None, ""):
+                    value = values_by_name.get(name)
+                settings[setting] = value
+                break
+    if "resolution_x" in settings or "resolution_y" in settings:
+        settings["resolution"] = [settings.get("resolution_x"), settings.get("resolution_y")]
+    return settings
+
+
+def _extract_diff_nodes(payload: dict[str, Any], include_parms: bool = False) -> dict[str, dict[str, Any]]:
+    candidates: list[Any] = []
+    if isinstance(payload.get("network"), dict):
+        candidates.extend(payload["network"].get("nodes", []) or [])
+    candidates.extend(payload.get("nodes", []) or [])
+    if isinstance(payload.get("selected"), dict):
+        candidates.extend(payload["selected"].get("nodes", []) or [])
+    candidates.extend(payload.get("selected_details", []) or [])
+    nodes: dict[str, dict[str, Any]] = {}
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        summary = item.get("node") if isinstance(item.get("node"), dict) else item
+        path = summary.get("path") if isinstance(summary, dict) else None
+        if not isinstance(path, str) or not path:
+            continue
+        record = {key: summary.get(key) for key in ("path", "name", "type", "category", "parent") if key in summary}
+        if include_parms:
+            parms = item.get("parms") or item.get("parameters")
+            if isinstance(parms, list):
+                record["parms"] = {
+                    str(parm.get("name")): parm.get("value", parm.get("raw_value"))
+                    for parm in parms
+                    if isinstance(parm, dict) and parm.get("name")
+                }
+        nodes[path] = record
+    return nodes
+
+
+def _extract_diff_wires(payload: dict[str, Any]) -> set[str]:
+    network_payload = payload.get("network") if isinstance(payload.get("network"), dict) else payload
+    wires = network_payload.get("wires", []) if isinstance(network_payload, dict) else []
+    keys = set()
+    for wire in wires:
+        if not isinstance(wire, dict):
+            continue
+        src = wire.get("src")
+        dst = wire.get("dst")
+        input_index = wire.get("input_index", 0)
+        if isinstance(src, str) and isinstance(dst, str):
+            keys.add("%s\t%s\t%s" % (src, dst, input_index))
+    return keys
+
+
+def _node_diff(before: dict[str, Any], after: dict[str, Any], include_parms: bool = False) -> dict[str, Any]:
+    changes: dict[str, Any] = {}
+    for key in ("name", "type", "category", "parent"):
+        if before.get(key) != after.get(key):
+            changes[key] = {"before": before.get(key), "after": after.get(key)}
+    if include_parms:
+        before_parms = before.get("parms") if isinstance(before.get("parms"), dict) else {}
+        after_parms = after.get("parms") if isinstance(after.get("parms"), dict) else {}
+        parm_changes = {}
+        for name in sorted(set(before_parms) | set(after_parms)):
+            if before_parms.get(name) != after_parms.get(name):
+                parm_changes[name] = {"before": before_parms.get(name), "after": after_parms.get(name)}
+        if parm_changes:
+            changes["parms"] = parm_changes
+    return changes
+
+
+def _wire_from_key(key: str) -> dict[str, Any]:
+    src, dst, input_index = (key.split("\t") + ["", "", "0"])[:3]
+    try:
+        input_index_value: Any = int(input_index)
+    except ValueError:
+        input_index_value = input_index
+    return {"src": src, "dst": dst, "input_index": input_index_value}
+
+
+def _paginate(items: list[Any], limit: int, offset: int) -> tuple[list[Any], dict[str, Any]]:
+    total = len(items)
+    page = items[offset : offset + limit]
+    return page, {
+        "total": total,
+        "count": len(page),
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + limit < total,
+        "truncated": offset + limit < total,
+        "next_offset": offset + limit if offset + limit < total else None,
+    }
+
+
+def _diagnostic_steps(preset: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    path = str(payload.get("path") or "")
+    root = str(payload.get("root") or "")
+    if preset == "scene_overview":
+        target = root or path or "/obj"
+        return [
+            {"command": "context", "payload": {"fields": ["hip_file", "current_network", "frame", "edit_enabled"]}},
+            {"command": "selected", "payload": {"fields": ["count", "nodes.path", "nodes.type"]}},
+            {"command": "scene_snapshot", "payload": {"path": target, "mode": "routing", "fields": ["summary", "semantics.scene_understanding", "semantics.risk_domains", "network.path", "network.node_count"]}},
+            {"command": "find_error_nodes", "payload": {"root": target, "limit": 25, "fields": ["count", "error_count", "warning_count", "nodes.path", "nodes.errors", "nodes.warnings", "response_meta"]}},
+        ]
+    if preset == "node_debug":
+        target = path or root or "/obj"
+        return [
+            {"command": "node_info", "payload": {"path": target, "fields": ["path", "type", "category", "parent", "flags", "messages", "inputs.path", "outputs.path"]}},
+            {"command": "node_parms", "payload": {"path": target, "fields": ["node.path", "parm_count", "parms.name", "parms.value", "parms.expression", "parms.locked"]}},
+            {"command": "parameter_schema", "payload": {"path": target, "fields": ["node.path", "parameter_count", "parameters.name", "parameters.label", "parameters.type", "parameters.default_value", "parameters.menu_items"]}},
+            {"command": "geometry_summary", "payload": {"path": target, "fields": ["node.path", "available", "counts", "bounds", "point_attributes.name", "primitive_attributes.name"]}},
+        ]
+    if preset == "render_readiness":
+        target = root or path or "/out"
+        return [
+            {"command": "render_info", "payload": {"root": target, "limit": 25, "fields": ["roots", "total", "nodes.node.path", "nodes.settings", "nodes.errors", "nodes.warnings", "summary", "response_meta"]}},
+            {"command": "find_error_nodes", "payload": {"root": target, "limit": 25, "fields": ["count", "error_count", "warning_count", "nodes.path", "nodes.errors", "nodes.warnings", "response_meta"]}},
+            {"command": "list_node_types", "payload": {"name": "render", "limit": 25, "fields": ["total", "node_types.name", "node_types.category", "node_types.description", "response_meta"]}},
+        ]
+    if preset == "material_readiness":
+        target = root or path or "/mat"
+        return [
+            {"command": "material_info", "payload": {"root": target, "limit": 25, "fields": ["mode", "root", "count", "materials.node.path", "materials.node.type", "materials.texture_count", "materials.texture_paths", "response_meta"]}},
+            {"command": "find_error_nodes", "payload": {"root": target, "limit": 25, "fields": ["count", "error_count", "warning_count", "nodes.path", "nodes.errors", "nodes.warnings", "response_meta"]}},
+            {"command": "list_node_types", "payload": {"name": "material", "limit": 25, "fields": ["total", "node_types.name", "node_types.category", "node_types.description", "response_meta"]}},
+        ]
+    raise BridgeCommandError("Unknown diagnostic preset: %s" % preset)
+
+
+def _with_response_meta(
+    command: str,
+    result: dict[str, Any],
+    pagination: dict[str, Any] | None = None,
+    item_count: int | None = None,
+    total: int | None = None,
+    truncated: bool | None = None,
+) -> dict[str, Any]:
+    enriched = dict(result)
+    pagination_meta = pagination
+    if pagination_meta is None and isinstance(result.get("pagination"), dict):
+        pagination_meta = result.get("pagination")
+    enriched["response_meta"] = _response_meta(
+        command,
+        result,
+        pagination=pagination_meta,
+        item_count=item_count,
+        total=total,
+        truncated=truncated,
+    )
+    return enriched
+
+
+def _response_meta(
+    command: str,
+    result: dict[str, Any],
+    pagination: dict[str, Any] | None = None,
+    item_count: int | None = None,
+    total: int | None = None,
+    truncated: bool | None = None,
+) -> dict[str, Any]:
+    pagination = pagination or {}
+    if item_count is None:
+        for key in ("count", "node_count", "parm_count", "success_count"):
+            if isinstance(result.get(key), int):
+                item_count = int(result[key])
+                break
+    if total is None:
+        total = pagination.get("total") if isinstance(pagination.get("total"), int) else result.get("total")
+    if truncated is None:
+        truncated = bool(
+            result.get("truncated", False)
+            or result.get("has_more", False)
+            or pagination.get("truncated", False)
+            or pagination.get("has_more", False)
+        )
+    try:
+        size_bytes = len(json.dumps(result, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8"))
+    except Exception:
+        size_bytes = None
+    return {
+        "command": command,
+        "schema_version": 1,
+        "size_bytes": size_bytes,
+        "item_count": item_count,
+        "total": total,
+        "truncated": bool(truncated),
+        "has_more": bool(pagination.get("has_more", False)),
+        "limit": pagination.get("limit", result.get("limit")),
+        "offset": pagination.get("offset", result.get("offset")),
+        "next_offset": pagination.get("next_offset"),
+    }
+
+
+_MISSING = object()
+
+
+def _project_response(command: str, result: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    fields = payload.get("fields")
+    if not fields:
+        return result
+    original_size = _json_size_bytes(result)
+    projected: dict[str, Any] = {}
+    for field in fields:
+        parts = str(field).split(".")
+        value = _extract_projected_value(result, parts)
+        if value is _MISSING:
+            continue
+        _merge_projected_value(projected, parts, value)
+    meta = _response_meta(command, projected)
+    meta["projected"] = True
+    meta["requested_fields"] = list(fields)
+    meta["original_size_bytes"] = original_size
+    projected["response_meta"] = meta
+    return projected
+
+
+def _json_size_bytes(value: Any) -> int | None:
+    try:
+        return len(json.dumps(value, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8"))
+    except Exception:
+        return None
+
+
+def _extract_projected_value(value: Any, parts: list[str]) -> Any:
+    if not parts:
+        return value
+    head, tail = parts[0], parts[1:]
+    if isinstance(value, dict):
+        if head not in value:
+            return _MISSING
+        return _extract_projected_value(value[head], tail)
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            extracted = _extract_projected_value(item, parts)
+            if extracted is not _MISSING:
+                items.append(extracted)
+        return items
+    return _MISSING
+
+
+def _merge_projected_value(target: dict[str, Any], parts: list[str], value: Any) -> None:
+    if not parts:
+        return
+    head, tail = parts[0], parts[1:]
+    if not tail:
+        target[head] = value
+        return
+    existing = target.get(head)
+    if not isinstance(existing, dict):
+        existing = {}
+        target[head] = existing
+    if isinstance(value, list):
+        existing[tail[0]] = value
+        return
+    _merge_projected_value(existing, tail, value)
+
+
+def _houdini_docs_link(help_type: str, item_name: str, category: str = "") -> dict[str, Any]:
+    item = quote(str(item_name or "").strip().replace(" ", "_"))
+    category_name = quote(str(category or "").strip().lower())
+    base = "https://www.sidefx.com/docs/houdini"
+    if help_type == "node" and item:
+        url = "%s/nodes/%s/%s.html" % (base, category_name or "sop", item)
+    elif help_type == "expression" and item:
+        url = "%s/expressions/%s.html" % (base, item)
+    elif help_type == "hscript" and item:
+        url = "%s/commands/%s.html" % (base, item)
+    elif help_type == "python" and item:
+        url = "%s/hom/%s.html" % (base, item)
+    else:
+        url = "%s/" % base
+    return {
+        "url": url,
+        "domain": "sidefx.com",
+        "fetch_required": False,
+        "source": "fixed_sidefx_docs_url",
+    }
+
+
+def _screenshot_path(prefix: str) -> str:
+    from . import auth
+    directory = str(auth.runtime_dir() / "screenshots")
+    os.makedirs(directory, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    suffix = hashlib.sha1(("%s-%s" % (prefix, time.time())).encode("utf-8")).hexdigest()[:8]
+    return os.path.join(directory, "%s_%s_%s.png" % (prefix, stamp, suffix))
+
+
+def _available_pane_types(hou: Any) -> list[str]:
+    pane_tab_type = getattr(hou, "paneTabType", None)
+    if pane_tab_type is None:
+        return []
+    return sorted(name for name in dir(pane_tab_type) if not name.startswith("_") and name != "thisown")
+
+
+def _pane_type(hou: Any, type_name: str) -> Any | None:
+    return getattr(getattr(hou, "paneTabType", None), type_name, None)
+
+
+def _find_pane(hou: Any, type_name: str) -> Any | None:
+    ui = getattr(hou, "ui", None)
+    pane_type = _pane_type(hou, type_name)
+    if ui is None or pane_type is None:
+        return None
+    desktop = _safe_call(lambda: ui.curDesktop(), default=None)
+    if desktop is not None and hasattr(desktop, "paneTabs"):
+        for pane in desktop.paneTabs():
+            kind = _safe_call(lambda: pane.type(), default=None)
+            name = _safe_call(kind.name, default="") if hasattr(kind, "name") else str(kind)
+            if name != type_name:
+                continue
+            if not _safe_node_method(pane, "isCurrentTab", True):
+                continue
+            geometry = _pane_geometry(pane)
+            if geometry and geometry["width"] > 0 and geometry["height"] > 0:
+                return pane
+        # Do not fall through to a hidden tab on a different desktop.
+        return None
+    return _safe_call(lambda: ui.paneTabOfType(pane_type), default=None)
+
+
+def _pane_summary(pane: Any, desktop_name: str, current_desktop_name: str, fallback_type: str = "") -> dict[str, Any]:
+    geometry = _pane_geometry(pane)
+    pane_type = _safe_call(lambda: pane.type(), default=None)
+    pane_type_name = _safe_call(pane_type.name, default="") if pane_type is not None and hasattr(pane_type, "name") else str(pane_type or fallback_type)
+    if pane_type_name == "None":
+        pane_type_name = fallback_type
+    visible = bool(geometry and geometry.get("width", 0) > 0 and geometry.get("height", 0) > 0 and _safe_node_method(pane, "isCurrentTab", True))
+    return {
+        "name": _safe_call(pane.name, default=""),
+        "type": pane_type_name,
+        "desktop": desktop_name,
+        "is_current_desktop": bool(desktop_name and desktop_name == current_desktop_name),
+        "is_visible": visible,
+        "geometry": geometry if visible else None,
+        "capturable": visible and (not current_desktop_name or desktop_name == current_desktop_name),
+    }
+
+
+def _pane_geometry(pane: Any) -> dict[str, int] | None:
+    geom = _safe_call(lambda: pane.qtScreenGeometry(), default=None)
+    if geom is None:
+        return None
+    return {
+        "x": int(_safe_call(geom.x, default=0)),
+        "y": int(_safe_call(geom.y, default=0)),
+        "width": int(_safe_call(geom.width, default=0)),
+        "height": int(_safe_call(geom.height, default=0)),
+    }
+
+
+def _fit_pane(pane: Any) -> None:
+    for method_name in ("homeAll", "homeToSelection", "homeSelected"):
+        method = getattr(pane, method_name, None)
+        if method is not None:
+            _safe_call(method, default=None)
+            return
+
+
+def _navigate_network_pane(pane: Any, node: Any, node_path: str) -> None:
+    if hasattr(pane, "setPwd"):
+        pane.setPwd(node)
+        return
+    if hasattr(pane, "cd"):
+        pane.cd(node_path)
+        return
+    raise BridgeCommandError("NetworkEditor pane does not expose a supported navigation API.")
+
+
+def _capture_pane_to_path(pane: Any, path: str) -> str:
+    for method_name in ("saveScreenshot", "saveViewToImage", "saveImage"):
+        method = getattr(pane, method_name, None)
+        if method is not None:
+            method(path)
+            if os.path.exists(path):
+                return "pane." + method_name
+    grab = getattr(pane, "grab", None)
+    if grab is not None:
+        pixmap = grab()
+        save = getattr(pixmap, "save", None)
+        if save is not None:
+            save(path, "PNG")
+            if os.path.exists(path):
+                return "pane.grab"
+    geometry = _pane_geometry(pane)
+    if not geometry or geometry["width"] <= 0 or geometry["height"] <= 0:
+        raise BridgeCommandError("Pane has invalid screen geometry and cannot be captured.")
+    _capture_qt_pane_widget(pane, path, geometry)
+    return "qt_houdini_widget"
+
+
+def _capture_qt_pane_widget(pane, path, geometry):
+    try:
+        from PySide6 import QtCore, QtWidgets
+    except ImportError:
+        from PySide2 import QtCore, QtWidgets
+    hou = _import_hou()
+    window = hou.qt.mainWindow()
+    floating = _safe_node_method(pane, "floatingPanel")
+    if floating is not None:
+        float_window = getattr(hou.qt, "floatingPanelWindow", None)
+        window = _safe_call(lambda: float_window(floating)) if float_window else None
+        if window is None:
+            origin = QtCore.QPoint(geometry["x"], geometry["y"])
+            area = QtCore.QRect(origin, QtCore.QSize(geometry["width"], geometry["height"]))
+            candidates = [widget for widget in QtWidgets.QApplication.topLevelWidgets()
+                          if widget.isVisible() and widget.frameGeometry().contains(area)]
+            window = min(candidates, key=lambda item: item.width() * item.height(), default=None)
+    if window is None:
+        raise BridgeCommandError("Could not resolve the pane to a Houdini window.")
+    origin = window.mapFromGlobal(QtCore.QPoint(geometry["x"], geometry["y"]))
+    area = QtCore.QRect(origin, QtCore.QSize(geometry["width"], geometry["height"]))
+    if not window.rect().contains(area):
+        raise BridgeCommandError("The requested pane does not fit inside its Houdini window.")
+    pixmap = window.grab(area)
+    if pixmap.isNull() or not pixmap.save(path, "PNG"):
+        raise BridgeCommandError("Could not capture the Houdini pane widget.")
+
+
+def _pane_capture_result(pane: Any, path: str, pane_type_name: str) -> dict[str, Any]:
+    if not os.path.exists(path):
+        raise BridgeCommandError("Pane screenshot did not create an image file.")
+    return {
+        "path": path,
+        "bytes": os.path.getsize(path),
+        "pane_type": pane_type_name,
+        "pane_name": _safe_call(pane.name, default=""),
+        "image_status": _viewport_image_status(path),
+        "geometry": _pane_geometry(pane),
+    }
 
 
 def _set_node_name(node: Any, name: str, unique: bool = True) -> None:
@@ -1846,6 +3491,8 @@ def _validate_plan_step(
         protocol.validate_command(command, payload)
     except Exception as exc:
         issues.append(str(exc))
+    if command == "python_submit":
+        issues.append("python_submit cannot run inside a command plan; submit it directly and poll its job status.")
     if not issues:
         report = _inspect_plan_step(hou, command, payload, planned_paths or set(), aliases or {})
         issues.extend(report.get("issues", []))
@@ -2999,35 +4646,31 @@ def _selection_parent_path(selected_result: dict[str, Any]) -> str:
     return ""
 
 
-def _node_details(node: Any) -> dict[str, Any]:
+def _node_details(node: Any, fields=None) -> dict[str, Any]:
     details = _node_summary(node)
-    inputs = []
-    for input_node in _safe_call(node.inputs, default=[]):
-        inputs.append(_node_summary(input_node) if input_node else None)
-    outputs = [_node_summary(output) for output in _safe_call(node.outputs, default=[])]
-    children = [_node_summary(child) for child in _safe_call(node.children, default=[])]
-    parms = [_parm_summary(parm) for parm in _safe_call(node.parms, default=[])]
-    details.update(
-        {
-            "inputs": inputs,
-            "outputs": outputs,
-            "children": children,
-            "parms": parms,
-            "flags": {
+    wanted = {str(f).split(".")[0] for f in fields} if fields else None
+    readers = {
+            "inputs": lambda: [_node_summary(n) if n else None for n in _safe_call(node.inputs, default=[])],
+            "outputs": lambda: [_node_summary(n) for n in _safe_call(node.outputs, default=[])],
+            "children": lambda: [_node_summary(n) for n in _safe_call(node.children, default=[])],
+            "parms": lambda: [_parm_summary(p) for p in _safe_call(node.parms, default=[])],
+            "flags": lambda: {
                 "display": _safe_node_method(node, "isDisplayFlagSet", default=False),
                 "render": _safe_node_method(node, "isRenderFlagSet", default=False),
                 "bypass": _safe_node_method(node, "isBypassed", default=False),
                 "selected": _safe_node_method(node, "isSelected", default=False),
             },
-            "comment": _safe_call(node.comment, default=""),
-            "position": _jsonable(_safe_call(node.position, default=[])),
-            "color": _jsonable(_safe_call(node.color, default=None)),
-            "messages": {
+            "comment": lambda: _safe_call(node.comment, default=""),
+            "position": lambda: _jsonable(_safe_call(node.position, default=[])),
+            "color": lambda: _jsonable(_safe_call(node.color, default=None)),
+            "messages": lambda: {
                 "errors": list(_safe_call(node.errors, default=[])),
                 "warnings": list(_safe_call(node.warnings, default=[])),
             },
-        }
-    )
+    }
+    for key, read in readers.items():
+        if wanted is None or key in wanted:
+            details[key] = read()
     return details
 
 
@@ -3120,6 +4763,37 @@ def _parm_summary(parm: Any) -> dict[str, Any]:
     }
 
 
+def _filter_parms(parms: list[Any], payload: dict[str, Any]) -> list[Any]:
+    requested = payload.get("parm_names")
+    requested_set = {str(name).lower() for name in requested} if isinstance(requested, list) else set()
+    contains = str(payload.get("name_contains") or "").lower()
+    limit = payload.get("limit")
+    filtered = []
+    for parm in parms:
+        name = str(_safe_call(parm.name, default=""))
+        label = str(_safe_call(lambda p=parm: p.parmTemplate().label(), default=""))
+        haystack = "%s %s" % (name.lower(), label.lower())
+        if requested_set and name.lower() not in requested_set:
+            continue
+        if contains and contains not in haystack:
+            continue
+        filtered.append(parm)
+        if isinstance(limit, int) and len(filtered) >= limit:
+            break
+    return filtered
+
+
+def _parm_filter_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "parm_names": list(payload.get("parm_names") or []),
+        "name_contains": payload.get("name_contains"),
+        "limit": payload.get("limit"),
+        "include_defaults": payload.get("include_defaults", True),
+        "include_menu": payload.get("include_menu", True),
+        "include_ranges": payload.get("include_ranges", True),
+    }
+
+
 def _parm_details(parm: Any) -> dict[str, Any]:
     summary = _parm_summary(parm)
     expression = _safe_call(parm.expression, default=None)
@@ -3137,6 +4811,154 @@ def _parm_details(parm: Any) -> dict[str, Any]:
         }
     )
     return summary
+
+
+def _parm_schema_details(
+    parm: Any,
+    node: Any,
+    include_defaults: bool = True,
+    include_menu: bool = True,
+    include_ranges: bool = True,
+) -> dict[str, Any]:
+    summary = _parm_summary(parm)
+    template = _safe_call(parm.parmTemplate, default=None)
+    keyframes = _safe_call(parm.keyframes, default=[])
+    expression = _safe_call(parm.expression, default=None)
+    if expression == "":
+        expression = None
+    summary.update(
+        {
+            "node_type": _safe_call(lambda: node.type().name(), default=""),
+            "value": _jsonable(_safe_call(parm.eval, default=None)),
+            "raw_value": _safe_call(parm.rawValue, default=None),
+            "expression": expression,
+            "locked": _safe_call(parm.isLocked, default=False),
+            "has_keyframes": bool(keyframes),
+            "keyframe_count": len(keyframes) if keyframes is not None else 0,
+        }
+    )
+    if include_defaults:
+        summary["default_value"] = _template_default_value(template)
+    if include_ranges:
+        summary.update(_template_range_details(template))
+    if include_menu:
+        summary.update(_template_menu_details(template))
+    return summary
+
+
+def _template_default_value(template: Any) -> Any:
+    if template is None:
+        return None
+    for method_name in ("defaultValue", "defaultExpression"):
+        method = getattr(template, method_name, None)
+        if method is None:
+            continue
+        value = _safe_call(method, default=None) if callable(method) else method
+        if value is not None:
+            return _jsonable(value)
+    return None
+
+
+def _template_range_details(template: Any) -> dict[str, Any]:
+    if template is None:
+        return {}
+    details = {}
+    for key, method_name in (
+        ("min", "minValue"),
+        ("max", "maxValue"),
+        ("min_strict", "minIsStrict"),
+        ("max_strict", "maxIsStrict"),
+    ):
+        method = getattr(template, method_name, None)
+        if method is None:
+            continue
+        value = _safe_call(method, default=None) if callable(method) else method
+        if value is not None:
+            details[key] = _jsonable(value)
+    return details
+
+
+def _template_menu_details(template: Any) -> dict[str, Any]:
+    if template is None:
+        return {}
+    items_func = getattr(template, "menuItems", None)
+    labels_func = getattr(template, "menuLabels", None)
+    items = _safe_call(items_func, default=None) if items_func is not None else None
+    labels = _safe_call(labels_func, default=None) if labels_func is not None else None
+    if items is None and labels is None:
+        return {}
+    return {
+        "menu_items": _jsonable(items or []),
+        "menu_labels": _jsonable(labels or []),
+    }
+
+
+def _safe_node_geometry(node: Any) -> Any:
+    geo = _safe_call(node.geometry, default=None)
+    if geo is not None:
+        return geo
+    display_node = _safe_call(getattr(node, "displayNode", lambda: None), default=None)
+    if display_node is not None:
+        return _safe_call(display_node.geometry, default=None)
+    return None
+
+
+def _geo_counts(geo: Any) -> dict[str, Any]:
+    candidates = {
+        "points": (("intrinsicValue", "pointcount"), ("points", None)),
+        "primitives": (("intrinsicValue", "primitivecount"), ("prims", None)),
+        "vertices": (("intrinsicValue", "vertexcount"), ("vertices", None)),
+    }
+    counts = {}
+    for key, methods in candidates.items():
+        value = None
+        for method_name, argument in methods:
+            method = getattr(geo, method_name, None)
+            if method is None:
+                continue
+            if argument is None:
+                result = _safe_call(method, default=None)
+                value = len(result) if isinstance(result, (list, tuple)) else result
+            else:
+                value = _safe_call(lambda method=method, argument=argument: method(argument), default=None)
+            if value is not None:
+                break
+        if value is not None:
+            counts[key] = value
+    return counts
+
+
+def _geo_bounds(geo: Any) -> Any:
+    box = _safe_call(getattr(geo, "boundingBox", lambda: None), default=None)
+    if box is None:
+        return None
+    min_vec = _safe_call(getattr(box, "minvec", lambda: None), default=None)
+    max_vec = _safe_call(getattr(box, "maxvec", lambda: None), default=None)
+    if min_vec is None and hasattr(box, "min"):
+        min_vec = _safe_call(box.min, default=None)
+    if max_vec is None and hasattr(box, "max"):
+        max_vec = _safe_call(box.max, default=None)
+    if min_vec is None or max_vec is None:
+        return None
+    return [_jsonable(min_vec), _jsonable(max_vec)]
+
+
+def _attrib_details(attrib: Any) -> dict[str, Any]:
+    data_type = _safe_call(lambda: attrib.dataType().name(), default="")
+    return {
+        "name": _safe_call(attrib.name, default=""),
+        "type": data_type,
+        "size": _safe_call(attrib.size, default=None),
+    }
+
+
+def _group_details(group: Any) -> dict[str, Any]:
+    entries = _safe_call(getattr(group, "entries", lambda: None), default=None)
+    size = len(entries) if isinstance(entries, (list, tuple)) else _safe_call(getattr(group, "size", lambda: None), default=None)
+    return {
+        "name": _safe_call(group.name, default=""),
+        "size": size,
+    }
 
 
 def _jsonable(value: Any) -> Any:
@@ -3159,7 +4981,7 @@ def _current_network_path(hou: Any) -> str:
     pane_type = getattr(getattr(hou, "paneTabType", None), "NetworkEditor", None)
     ui = getattr(hou, "ui", None)
     if ui is not None and pane_type is not None:
-        pane = _safe_call(lambda: ui.paneTabOfType(pane_type), default=None)
+        pane = _find_pane(hou, "NetworkEditor")
         if pane is not None:
             pwd = _safe_call(pane.pwd, default=None)
             if pwd is not None:

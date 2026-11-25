@@ -1,34 +1,51 @@
 """JSON protocol for the Blib Houdini Bridge.
 
-The bridge defaults to read-only. Edit commands exist only behind Houdini-side
-edit mode, and danger command names are reserved so tests keep them blocked.
+The bridge starts editable. The Houdini-side read-only switch controls edits and Python.
 """
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from typing import Any
 
 
-BRIDGE_VERSION = "0.2.0"
+BRIDGE_VERSION = "0.3.0a3"
 
 READ_COMMANDS = frozenset(
     {
+        "inspect_batch",
+        "look_batch",
         "health",
+        "python_job_status",
+        "capture_multiple_panes",
         "context",
+        "diagnostic_bundle",
         "downstream",
         "edit_mode",
+        "find_error_nodes",
         "find_nodes",
+        "geometry_summary",
+        "get_houdini_help",
+        "list_node_types",
+        "list_panes",
         "manifest",
+        "material_info",
+        "multi_read",
         "network",
+        "network_screenshot",
         "node_parms",
+        "pane_screenshot",
+        "parameter_schema",
         "profile_manifest",
         "probe_parm_profile",
         "recipe_manifest",
         "review_plan",
+        "render_info",
         "rpc_log",
         "scene_snapshot",
+        "scene_diff",
         "upstream",
         "selected",
         "node_info",
@@ -38,8 +55,54 @@ READ_COMMANDS = frozenset(
     }
 )
 
+MULTI_READ_ALLOWED_COMMANDS = frozenset(
+    {
+        "context",
+        "downstream",
+        "edit_mode",
+        "find_error_nodes",
+        "find_nodes",
+        "geometry_summary",
+        "get_houdini_help",
+        "list_node_types",
+        "material_info",
+        "network",
+        "node_info",
+        "node_parms",
+        "parameter_schema",
+        "render_info",
+        "rpc_log",
+        "scene_snapshot",
+        "selected",
+        "upstream",
+    }
+)
+
+FIELD_PROJECTABLE_READ_COMMANDS = frozenset(
+    {
+        "context",
+        "diagnostic_bundle",
+        "find_error_nodes",
+        "find_nodes",
+        "geometry_summary",
+        "get_houdini_help",
+        "list_node_types",
+        "material_info",
+        "multi_read",
+        "network",
+        "node_info",
+        "node_parms",
+        "parameter_schema",
+        "render_info",
+        "scene_snapshot",
+        "selected",
+    }
+)
+
 EDIT_COMMANDS = frozenset(
     {
+        "edit_batch",
+        "python_submit",
         "batch_set_parms",
         "connect",
         "bypass_node",
@@ -64,12 +127,15 @@ EDIT_COMMANDS = frozenset(
         "apply_parm_profile",
         "run_plan",
         "set_parm",
+        "set_parm_expression",
         "set_position",
+        "set_frame",
     }
 )
 
 DIRECT_EDIT_COMMANDS = frozenset(
     {
+        "python_submit",
         "batch_set_parms",
         "bypass_node",
         "connect",
@@ -82,13 +148,16 @@ DIRECT_EDIT_COMMANDS = frozenset(
         "set_input",
         "set_node_color",
         "set_parm",
+        "set_parm_expression",
         "set_position",
+        "set_frame",
     }
 )
 
 PLAN_REQUIRED_EDIT_COMMANDS = EDIT_COMMANDS - DIRECT_EDIT_COMMANDS - {"run_plan"}
 
 DIRECT_EDIT_VERIFICATION_CONTRACTS = {
+    "python_submit": {"read_tools": ["python_job_status"], "success_criteria": ["The job status is succeeded; verify requested scene effects separately."]},
     "batch_set_parms": {
         "read_tools": ["node_parms", "node_info"],
         "success_criteria": ["Changed parameter values are readable from node_parms.", "The touched node still exists."],
@@ -137,9 +206,17 @@ DIRECT_EDIT_VERIFICATION_CONTRACTS = {
         "read_tools": ["node_parms", "node_info"],
         "success_criteria": ["node_parms reports the requested parameter value or expression.", "The touched node still exists."],
     },
+    "set_parm_expression": {
+        "read_tools": ["node_parms", "node_info"],
+        "success_criteria": ["node_parms reports the requested parameter expression.", "The touched node still exists."],
+    },
     "set_position": {
         "read_tools": ["node_info"],
         "success_criteria": ["node_info.position matches the requested network-editor position."],
+    },
+    "set_frame": {
+        "read_tools": ["context"],
+        "success_criteria": ["context.timeline.current matches the requested frame."],
     },
 }
 
@@ -158,6 +235,8 @@ DANGER_COMMANDS = frozenset(
 )
 
 COMMANDS = {
+    "python_submit": {"permission": "edit", "description": "Submit arbitrary Python with full Houdini process privileges; requires editable mode. Poll python_job_status using the same UUID. A queued job is not success."},
+    "python_job_status": {"permission": "read", "description": "Query the status and captured output of one Python job by UUID."},
     "health": {
         "permission": "read",
         "description": "Report whether the Houdini bridge is reachable.",
@@ -190,6 +269,10 @@ COMMANDS = {
         "permission": "read",
         "description": "Read basic session, timeline, network, and selection context.",
     },
+    "diagnostic_bundle": {
+        "permission": "read",
+        "description": "Run a built-in safe read-only diagnostic preset such as scene overview, node debug, render readiness, or material readiness.",
+    },
     "selected": {
         "permission": "read",
         "description": "Read the current Houdini node selection.",
@@ -197,6 +280,10 @@ COMMANDS = {
     "scene_snapshot": {
         "permission": "read",
         "description": "Read a compact scene context bundle for external planning.",
+    },
+    "scene_diff": {
+        "permission": "read",
+        "description": "Compare two scene, network, or snapshot payloads and summarize node and wiring differences.",
     },
     "find_nodes": {
         "permission": "read",
@@ -210,9 +297,57 @@ COMMANDS = {
         "permission": "read",
         "description": "Read parameter values, expressions, locks, and keyframe state for one node.",
     },
+    "parameter_schema": {
+        "permission": "read",
+        "description": "Read parameter template metadata, ranges, defaults, menus, and current values for one node.",
+    },
+    "geometry_summary": {
+        "permission": "read",
+        "description": "Read compact geometry counts, attributes, groups, and bounds for one SOP-like node.",
+    },
+    "get_houdini_help": {
+        "permission": "read",
+        "description": "Return safe SideFX documentation links and local node type catalog matches without executing help scripts.",
+    },
+    "list_node_types": {
+        "permission": "read",
+        "description": "List available Houdini node types with filtering, pagination, and a short local cache.",
+    },
+    "material_info": {
+        "permission": "read",
+        "description": "Read material/shader node metadata, parameters, child shaders, and likely texture references.",
+    },
+    "multi_read": {
+        "permission": "read",
+        "description": "Run a bounded batch of safe read-only diagnostics in one bridge request to reduce client round trips.",
+    },
+    "find_error_nodes": {
+        "permission": "read",
+        "description": "Scan a network for nodes with current errors or warnings.",
+    },
+    "list_panes": {
+        "permission": "read",
+        "description": "List visible Houdini panes that may be useful for visual diagnostics.",
+    },
     "rpc_log": {
         "permission": "read",
         "description": "Read recent bridge RPC request history from the Houdini session.",
+    },
+    "pane_screenshot": {
+        "permission": "read",
+        "description": "Capture a visible Houdini pane tab to a temporary image file.",
+    },
+    "capture_multiple_panes": {
+        "permission": "read",
+        "description": "Capture several visible Houdini pane tabs to temporary image files in one read-only call.",
+    },
+    "network_screenshot": {
+        "permission": "read",
+        "description": "Navigate a Network Editor pane to a node path and capture it to a temporary image file.",
+    },
+    "render_info": {
+        "permission": "read",
+        "description": "Read render-related nodes, output paths, cameras, resolution, frame range, samples, and warnings without rendering.",
     },
     "viewport_screenshot": {
         "permission": "read",
@@ -232,7 +367,7 @@ COMMANDS = {
     },
     "edit_mode": {
         "permission": "read",
-        "description": "Read or change the Houdini-side bridge edit gate.",
+        "description": "Read the Bridge access mode or switch it to read-only. Restore editable mode in Houdini.",
     },
     "validate_plan": {
         "permission": "read",
@@ -338,9 +473,19 @@ COMMANDS = {
         "permission": "edit",
         "description": "Set one network node position when edit mode is enabled.",
     },
+    "set_parm_expression": {
+        "permission": "edit",
+        "description": "Set a Houdini expression on one existing parameter when edit mode is enabled.",
+    },
+    "set_frame": {
+        "permission": "edit",
+        "description": "Set the current Houdini timeline frame when edit mode is enabled.",
+    },
 }
 
 COMMAND_PAYLOAD_SCHEMAS = {
+    "python_submit": {"type": "object", "required": ["job_id", "code"], "properties": {"job_id": {"type": "string", "format": "uuid"}, "code": {"type": "string", "minLength": 1, "maxLength": 65536}, "inputs": {"type": "object", "description": "JSON object available to the script as bridge_inputs."}}, "additionalProperties": False},
+    "python_job_status": {"type": "object", "required": ["job_id"], "properties": {"job_id": {"type": "string", "format": "uuid"}}, "additionalProperties": False},
     "health": {"type": "object", "properties": {}, "additionalProperties": False},
     "manifest": {"type": "object", "properties": {}, "additionalProperties": False},
     "recipe_manifest": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -368,12 +513,38 @@ COMMAND_PAYLOAD_SCHEMAS = {
         "type": "object",
         "properties": {
             "path": {"type": "string", "format": "houdini_absolute_node_path"},
+            "mode": {"type": "string", "enum": ["full", "routing", "summary"], "default": "full"},
             "trace_depth": {"type": "integer", "minimum": 0, "maximum": 4, "default": 1},
             "max_selected": {"type": "integer", "minimum": 0, "maximum": 20, "default": 3},
             "include_viewport": {"type": "boolean", "default": False},
             "width": {"type": "integer", "minimum": 64, "maximum": 4096, "default": 1280},
             "height": {"type": "integer", "minimum": 64, "maximum": 4096, "default": 720},
             "prefix": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$", "default": "scene_snapshot"},
+        },
+        "additionalProperties": False,
+    },
+    "diagnostic_bundle": {
+        "type": "object",
+        "properties": {
+            "preset": {
+                "type": "string",
+                "enum": ["scene_overview", "node_debug", "render_readiness", "material_readiness"],
+                "default": "scene_overview",
+            },
+            "path": {"type": "string", "format": "houdini_absolute_node_path", "description": "Optional target node or network path."},
+            "root": {"type": "string", "format": "houdini_absolute_node_path", "description": "Optional root network for preset scans."},
+            "continue_on_error": {"type": "boolean", "default": True},
+        },
+        "additionalProperties": False,
+    },
+    "scene_diff": {
+        "type": "object",
+        "required": ["before", "after"],
+        "properties": {
+            "before": {"type": "object"},
+            "after": {"type": "object"},
+            "include_parms": {"type": "boolean", "default": False},
+            "max_changes": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200},
         },
         "additionalProperties": False,
     },
@@ -399,7 +570,115 @@ COMMAND_PAYLOAD_SCHEMAS = {
     "node_parms": {
         "type": "object",
         "required": ["path"],
-        "properties": {"path": {"type": "string", "format": "houdini_absolute_node_path"}},
+        "properties": {
+            "path": {"type": "string", "format": "houdini_absolute_node_path"},
+            "parm_names": {"type": "array", "items": {"type": "string"}, "maxItems": 200},
+            "name_contains": {"type": "string"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        },
+        "additionalProperties": False,
+    },
+    "parameter_schema": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+            "path": {"type": "string", "format": "houdini_absolute_node_path"},
+            "parm_names": {"type": "array", "items": {"type": "string"}, "maxItems": 200},
+            "name_contains": {"type": "string"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "include_defaults": {"type": "boolean", "default": True},
+            "include_menu": {"type": "boolean", "default": True},
+            "include_ranges": {"type": "boolean", "default": True},
+        },
+        "additionalProperties": False,
+    },
+    "geometry_summary": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+            "path": {"type": "string", "format": "houdini_absolute_node_path"},
+            "include_health": {"type": "boolean", "default": False, "description": "Inspect bounded polygon edge incidence and normal attribute presence."},
+        },
+        "additionalProperties": False,
+    },
+    "get_houdini_help": {
+        "type": "object",
+        "properties": {
+            "help_type": {
+                "type": "string",
+                "enum": ["node", "expression", "hscript", "python", "general"],
+                "default": "node",
+            },
+            "item_name": {"type": "string", "description": "Node type, expression, command, Python symbol, or help search text."},
+            "category": {"type": "string", "description": "Optional Houdini node category filter for local node catalog matches."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+            "offset": {"type": "integer", "minimum": 0, "maximum": 100000, "default": 0},
+            "fetch": {"type": "boolean", "default": False, "description": "Reserved for explicit future SideFX-only document fetching; currently returns links only."},
+        },
+        "additionalProperties": False,
+    },
+    "list_node_types": {
+        "type": "object",
+        "properties": {
+            "category": {"type": "string", "description": "Optional Houdini node category name such as Sop, Object, Lop, or Driver."},
+            "name": {"type": "string", "description": "Case-insensitive node type name substring filter."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+            "offset": {"type": "integer", "minimum": 0, "maximum": 100000, "default": 0},
+            "refresh": {"type": "boolean", "default": False},
+        },
+        "additionalProperties": False,
+    },
+    "material_info": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "format": "houdini_absolute_node_path", "description": "Optional material or shader node path to inspect."},
+            "root": {"type": "string", "format": "houdini_absolute_node_path", "default": "/mat"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+        },
+        "additionalProperties": False,
+    },
+    "multi_read": {
+        "type": "object",
+        "required": ["steps"],
+        "properties": {
+            "steps": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 20,
+                "items": {
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": {"type": "string"},
+                        "payload": {"type": "object", "default": {}},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "continue_on_error": {"type": "boolean", "default": True},
+        },
+        "additionalProperties": False,
+    },
+    "find_error_nodes": {
+        "type": "object",
+        "required": ["root"],
+        "properties": {
+            "root": {"type": "string", "format": "houdini_absolute_node_path"},
+            "include_warnings": {"type": "boolean", "default": True},
+            "include_errors": {"type": "boolean", "default": True},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+        },
+        "additionalProperties": False,
+    },
+    "list_panes": {
+        "type": "object",
+        "properties": {
+            "type": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_]+$",
+                "description": "Optional Houdini pane tab type name such as SceneViewer or NetworkEditor.",
+            },
+        },
         "additionalProperties": False,
     },
     "rpc_log": {
@@ -407,12 +686,61 @@ COMMAND_PAYLOAD_SCHEMAS = {
         "properties": {"limit": {"type": "integer", "minimum": 0, "maximum": 200, "default": 50}},
         "additionalProperties": False,
     },
+    "pane_screenshot": {
+        "type": "object",
+        "properties": {
+            "restore": {"type": "boolean", "default": False},
+            "type": {"type": "string", "pattern": "^[A-Za-z0-9_]+$", "default": "NetworkEditor"},
+            "prefix": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$", "default": "pane"},
+            "fit": {"type": "boolean", "default": False},
+        },
+        "additionalProperties": False,
+    },
+    "capture_multiple_panes": {
+        "type": "object",
+        "properties": {
+            "types": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^[A-Za-z0-9_]+$"},
+                "maxItems": 8,
+                "default": ["NetworkEditor", "SceneViewer", "Parm"],
+            },
+            "prefix": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$", "default": "panes"},
+            "fit": {"type": "boolean", "default": False},
+        },
+        "additionalProperties": False,
+    },
+    "network_screenshot": {
+        "type": "object",
+        "properties": {
+            "restore": {"type": "boolean", "default": False},
+            "path": {"type": "string", "format": "houdini_absolute_node_path", "default": "/obj"},
+            "prefix": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$", "default": "network"},
+            "fit": {"type": "boolean", "default": True},
+        },
+        "additionalProperties": False,
+    },
+    "render_info": {
+        "type": "object",
+        "properties": {
+            "root": {"type": "string", "format": "houdini_absolute_node_path", "description": "Optional root network to scan. Defaults to /out, /stage, and /obj when present."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100},
+            "offset": {"type": "integer", "minimum": 0, "maximum": 100000, "default": 0},
+            "include_parms": {"type": "boolean", "default": True},
+        },
+        "additionalProperties": False,
+    },
     "viewport_screenshot": {
         "type": "object",
         "properties": {
+            "camera": {"type": "string", "format": "houdini_absolute_node_path"},
+            "target": {"type": "string", "format": "houdini_absolute_node_path", "description": "Frame the target geometry bounds; may cook."},
             "width": {"type": "integer", "minimum": 64, "maximum": 4096, "default": 1280},
             "height": {"type": "integer", "minimum": 64, "maximum": 4096, "default": 720},
             "prefix": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$", "default": "viewport"},
+            "frame": {"type": "string", "enum": ["current", "selected", "all"], "default": "current"},
+            "view": {"type": "string", "enum": ["current", "front", "right", "top"], "default": "current"},
+            "timeline_frame": {"type": "number", "minimum": -100000, "maximum": 100000, "description": "Temporarily capture this timeline frame; restore it afterward."},
         },
         "additionalProperties": False,
     },
@@ -481,6 +809,25 @@ COMMAND_PAYLOAD_SCHEMAS = {
         },
         "additionalProperties": False,
     },
+    "set_parm_expression": {
+        "type": "object",
+        "required": ["node", "parm", "expression"],
+        "properties": {
+            "node": {"type": "string", "format": "houdini_absolute_node_path"},
+            "parm": {"type": "string", "format": "houdini_simple_name"},
+            "expression": {"type": "string", "minLength": 1, "maxLength": 1000},
+            "language": {"type": "string", "enum": ["hscript", "python"], "default": "hscript"},
+        },
+        "additionalProperties": False,
+    },
+    "set_frame": {
+        "type": "object",
+        "required": ["frame"],
+        "properties": {
+            "frame": {"type": "number", "minimum": -1000000, "maximum": 1000000},
+        },
+        "additionalProperties": False,
+    },
     "set_parm_any": {
         "type": "object",
         "required": ["node", "parms", "value"],
@@ -520,6 +867,7 @@ COMMAND_PAYLOAD_SCHEMAS = {
             "steps": {"type": "array"},
             "continue_on_error": {"type": "boolean", "default": False},
             "undo_label": {"type": "string", "maxLength": 120, "default": "Blib Bridge plan"},
+            "expected_context": {"type": "string", "description": "Optional context token; reject a changed scene/selection before executing."},
         },
         "additionalProperties": False,
     },
@@ -718,6 +1066,19 @@ COMMAND_PAYLOAD_SCHEMAS = {
     },
 }
 
+FIELD_PROJECTION_SCHEMA = {
+    "type": "array",
+    "items": {"type": "string", "pattern": "^[A-Za-z0-9_.]{1,120}$"},
+    "minItems": 1,
+    "maxItems": 80,
+    "description": "Optional dot-path field projection for smaller read responses, such as node.path or response_meta.size_bytes.",
+}
+
+for _field_command in FIELD_PROJECTABLE_READ_COMMANDS:
+    _schema = COMMAND_PAYLOAD_SCHEMAS.get(_field_command)
+    if isinstance(_schema, dict):
+        _schema.setdefault("properties", {})["fields"] = dict(FIELD_PROJECTION_SCHEMA)
+
 DEFAULT_RESULT_SCHEMA = {
     "type": "object",
     "description": "Bridge command result object.",
@@ -766,6 +1127,190 @@ COMMAND_RESULT_SCHEMAS = {
                     "warnings": {"type": "array"},
                 },
             },
+        },
+    },
+    "parameter_schema": {
+        "type": "object",
+        "description": "Read-only parameter template metadata and current values for one Houdini node.",
+        "properties": {
+            "node": {"type": "object"},
+            "parameter_count": {"type": "integer"},
+            "parameters": {"type": "array", "items": {"type": "object"}},
+        },
+    },
+    "geometry_summary": {
+        "type": "object",
+        "description": "Read-only compact geometry summary for one Houdini node.",
+        "properties": {
+            "node": {"type": "object"},
+            "available": {"type": "boolean"},
+            "counts": {"type": "object"},
+            "bounds": {"type": ["array", "null"]},
+            "point_attributes": {"type": "array", "items": {"type": "object"}},
+            "primitive_attributes": {"type": "array", "items": {"type": "object"}},
+            "vertex_attributes": {"type": "array", "items": {"type": "object"}},
+            "global_attributes": {"type": "array", "items": {"type": "object"}},
+            "point_groups": {"type": "array", "items": {"type": "object"}},
+            "primitive_groups": {"type": "array", "items": {"type": "object"}},
+            "health": {"type": "object", "description": "Optional bounded polygon inspection; incomplete scans are explicitly marked."},
+        },
+    },
+    "diagnostic_bundle": {
+        "type": "object",
+        "description": "Built-in read-only diagnostic preset result.",
+        "properties": {
+            "preset": {"type": "string"},
+            "target": {"type": "object"},
+            "steps": {"type": "array", "items": {"type": "object"}},
+            "bundle": {"type": "object"},
+            "response_meta": {"type": "object"},
+        },
+    },
+    "get_houdini_help": {
+        "type": "object",
+        "description": "Safe Houdini documentation link and local catalog search result.",
+        "properties": {
+            "help_type": {"type": "string"},
+            "item_name": {"type": "string"},
+            "docs": {"type": "object"},
+            "matches": {"type": "array", "items": {"type": "object"}},
+            "pagination": {"type": "object"},
+            "fetch": {"type": "object"},
+            "response_meta": {"type": "object"},
+        },
+    },
+    "list_node_types": {
+        "type": "object",
+        "description": "Read-only paginated Houdini node type catalog.",
+        "properties": {
+            "total": {"type": "integer"},
+            "count": {"type": "integer"},
+            "offset": {"type": "integer"},
+            "limit": {"type": "integer"},
+            "has_more": {"type": "boolean"},
+            "pagination": {"type": "object"},
+            "cache": {"type": "object"},
+            "node_types": {"type": "array", "items": {"type": "object"}},
+            "response_meta": {"type": "object"},
+        },
+    },
+    "material_info": {
+        "type": "object",
+        "description": "Read-only material and shader metadata.",
+        "properties": {
+            "mode": {"type": "string"},
+            "root": {"type": "string"},
+            "count": {"type": "integer"},
+            "materials": {"type": "array", "items": {"type": "object"}},
+            "material": {"type": "object"},
+            "response_meta": {"type": "object"},
+        },
+    },
+    "multi_read": {
+        "type": "object",
+        "description": "Bounded batch result for safe read-only diagnostics.",
+        "properties": {
+            "ok": {"type": "boolean"},
+            "count": {"type": "integer"},
+            "success_count": {"type": "integer"},
+            "error_count": {"type": "integer"},
+            "stopped": {"type": "boolean"},
+            "allowed_commands": {"type": "array", "items": {"type": "string"}},
+            "results": {"type": "array", "items": {"type": "object"}},
+            "response_meta": {"type": "object"},
+        },
+    },
+    "find_error_nodes": {
+        "type": "object",
+        "description": "Read-only scan result for nodes with errors or warnings under a network.",
+        "properties": {
+            "root": {"type": "string"},
+            "visited": {"type": "integer"},
+            "count": {"type": "integer"},
+            "error_count": {"type": "integer"},
+            "warning_count": {"type": "integer"},
+            "truncated": {"type": "boolean"},
+            "nodes": {"type": "array", "items": {"type": "object"}},
+            "response_meta": {"type": "object"},
+        },
+    },
+    "list_panes": {
+        "type": "object",
+        "description": "Read-only list of visible Houdini panes.",
+        "properties": {
+            "count": {"type": "integer"},
+            "capturable_count": {"type": "integer"},
+            "panes": {"type": "array", "items": {"type": "object"}},
+            "available_types": {"type": "array", "items": {"type": "string"}},
+        },
+    },
+    "pane_screenshot": {
+        "type": "object",
+        "description": "Temporary file capture of one Houdini pane.",
+        "properties": {
+            "path": {"type": "string"},
+            "bytes": {"type": "integer"},
+            "pane_type": {"type": "string"},
+            "pane_name": {"type": "string"},
+        },
+    },
+    "capture_multiple_panes": {
+        "type": "object",
+        "description": "Temporary file captures of several Houdini panes.",
+        "properties": {
+            "count": {"type": "integer"},
+            "success_count": {"type": "integer"},
+            "results": {"type": "array", "items": {"type": "object"}},
+        },
+    },
+    "network_screenshot": {
+        "type": "object",
+        "description": "Temporary file capture of a Network Editor pane after navigating to a node path.",
+        "properties": {
+            "path": {"type": "string"},
+            "bytes": {"type": "integer"},
+            "node_path": {"type": "string"},
+            "pane_type": {"type": "string"},
+            "pane_name": {"type": "string"},
+        },
+    },
+    "render_info": {
+        "type": "object",
+        "description": "Read-only render node and render setting diagnostics.",
+        "properties": {
+            "roots": {"type": "array", "items": {"type": "string"}},
+            "visited": {"type": "integer"},
+            "total": {"type": "integer"},
+            "count": {"type": "integer"},
+            "pagination": {"type": "object"},
+            "nodes": {"type": "array", "items": {"type": "object"}},
+            "warnings": {"type": "array", "items": {"type": "object"}},
+            "summary": {"type": "object"},
+            "response_meta": {"type": "object"},
+        },
+    },
+    "scene_diff": {
+        "type": "object",
+        "description": "Read-only diff of two scene, network, or snapshot payloads.",
+        "properties": {
+            "summary": {"type": "object"},
+            "nodes": {"type": "object"},
+            "wires": {"type": "object"},
+            "truncated": {"type": "boolean"},
+        },
+    },
+    "find_nodes": {
+        "type": "object",
+        "description": "Read-only node search result.",
+        "properties": {
+            "root": {"type": "string"},
+            "count": {"type": "integer"},
+            "visited": {"type": "integer"},
+            "limit": {"type": "integer"},
+            "truncated": {"type": "boolean"},
+            "filters": {"type": "object"},
+            "nodes": {"type": "array", "items": {"type": "object"}},
+            "response_meta": {"type": "object"},
         },
     },
     "validate_plan": {
@@ -997,6 +1542,38 @@ def normalize_command(command: str) -> str:
     return str(command or "").strip().replace("-", "_").lower()
 
 
+def _validate_fields(fields: Any, command: str) -> None:
+    if fields is None:
+        return
+    if not isinstance(fields, list) or not fields or len(fields) > 80:
+        raise BridgeProtocolError("%s fields must be a non-empty list with at most 80 entries." % command)
+    for field in fields:
+        if not isinstance(field, str) or not field or len(field) > 120:
+            raise BridgeProtocolError("%s fields entries must be non-empty strings up to 120 characters." % command)
+        parts = field.split(".")
+        if any(not part or not part.replace("_", "").isalnum() for part in parts):
+            raise BridgeProtocolError("%s fields entries must be dot paths with letters, numbers, and underscores only." % command)
+
+
+def _validate_parm_filter_payload(payload: dict[str, Any], command: str) -> None:
+    parm_names = payload.get("parm_names")
+    if parm_names is not None:
+        if not isinstance(parm_names, list) or len(parm_names) > 200:
+            raise BridgeProtocolError("%s parm_names must be a list with at most 200 entries." % command)
+        for name in parm_names:
+            if not isinstance(name, str) or not name or len(name) > 120:
+                raise BridgeProtocolError("%s parm_names entries must be non-empty strings up to 120 characters." % command)
+    name_contains = payload.get("name_contains")
+    if name_contains is not None and (not isinstance(name_contains, str) or len(name_contains) > 120):
+        raise BridgeProtocolError("%s name_contains must be a string up to 120 characters." % command)
+    limit = payload.get("limit")
+    if limit is not None and (not isinstance(limit, int) or limit < 1 or limit > 1000):
+        raise BridgeProtocolError("%s limit must be an integer between 1 and 1000 when provided." % command)
+    for key in ("include_defaults", "include_menu", "include_ranges"):
+        if key in payload and not isinstance(payload.get(key), bool):
+            raise BridgeProtocolError("%s %s must be boolean when provided." % (command, key))
+
+
 def new_request_id() -> str:
     return uuid.uuid4().hex
 
@@ -1025,17 +1602,77 @@ def validate_command(command: str, payload: dict[str, Any] | None = None) -> Non
     normalized = normalize_command(command)
     if not normalized:
         raise BridgeProtocolError("Command is required.")
+    if normalized in {"edit_batch", "inspect_batch", "look_batch"}:
+        from . import workflows
+        workflows.validate(normalized, payload or {})
+        return
     if normalized in DANGER_COMMANDS:
         raise BridgeProtocolError("Danger commands are not available in bridge v0.2.")
     if normalized not in READ_COMMANDS and normalized not in EDIT_COMMANDS:
         raise BridgeProtocolError("Unknown bridge command: %s" % normalized)
     payload = payload or {}
-    if normalized in {"node_info", "node_parms", "network", "upstream", "downstream"}:
+    if normalized in {"python_submit", "python_job_status"}:
+        try:
+            uuid.UUID(payload.get("job_id", ""))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise BridgeProtocolError("%s requires a UUID job_id." % normalized) from exc
+        if normalized == "python_submit":
+            code = payload.get("code")
+            if not isinstance(code, str) or not code.strip() or len(code) > 65536:
+                raise BridgeProtocolError("python_submit code must be a non-empty string of at most 65536 characters.")
+            if "inputs" in payload:
+                inputs = payload["inputs"]
+                if not isinstance(inputs, dict):
+                    raise BridgeProtocolError("Python inputs must be a JSON object.")
+                try:
+                    size = len(json.dumps(inputs, allow_nan=False, ensure_ascii=False).encode("utf-8"))
+                except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
+                    raise BridgeProtocolError("Python inputs must be valid JSON.") from exc
+                if size > 32768:
+                    raise BridgeProtocolError("Python inputs must be at most 32 KiB.")
+
+    if normalized in FIELD_PROJECTABLE_READ_COMMANDS:
+        _validate_fields(payload.get("fields"), normalized)
+
+    if normalized == "diagnostic_bundle":
+        preset = payload.get("preset", "scene_overview")
+        if preset not in {"scene_overview", "node_debug", "render_readiness", "material_readiness"}:
+            raise BridgeProtocolError("diagnostic_bundle preset must be scene_overview, node_debug, render_readiness, or material_readiness.")
+        for key in ("path", "root"):
+            value = payload.get(key)
+            if value is not None and (not isinstance(value, str) or not value.startswith("/")):
+                raise BridgeProtocolError("diagnostic_bundle %s must be an absolute Houdini node path when provided." % key)
+        continue_on_error = payload.get("continue_on_error", True)
+        if not isinstance(continue_on_error, bool):
+            raise BridgeProtocolError("diagnostic_bundle continue_on_error must be boolean when provided.")
+
+    if normalized in {"node_info", "node_parms", "parameter_schema", "geometry_summary", "network", "upstream", "downstream"}:
         node_path = payload.get("path")
         if not isinstance(node_path, str) or not node_path.startswith("/"):
             raise BridgeProtocolError("%s requires an absolute Houdini node path." % normalized)
 
+    if normalized == "geometry_summary" and not isinstance(payload.get("include_health", False), bool):
+        raise BridgeProtocolError("geometry_summary include_health must be boolean.")
+
+    if normalized in {"node_parms", "parameter_schema"}:
+        _validate_parm_filter_payload(payload, normalized)
+
+    if normalized == "find_error_nodes":
+        root = payload.get("root")
+        if not isinstance(root, str) or not root.startswith("/"):
+            raise BridgeProtocolError("find_error_nodes requires an absolute Houdini root path.")
+        include_warnings = payload.get("include_warnings", True)
+        include_errors = payload.get("include_errors", True)
+        if not isinstance(include_warnings, bool) or not isinstance(include_errors, bool):
+            raise BridgeProtocolError("find_error_nodes include_warnings/include_errors must be boolean when provided.")
+        limit = payload.get("limit", 100)
+        if not isinstance(limit, int) or limit < 1 or limit > 500:
+            raise BridgeProtocolError("find_error_nodes limit must be an integer between 1 and 500.")
+
     if normalized == "scene_snapshot":
+        mode = payload.get("mode", "full")
+        if mode not in {"full", "routing", "summary"}:
+            raise BridgeProtocolError("scene_snapshot mode must be full, routing, or summary.")
         path = payload.get("path")
         if path is not None and (not isinstance(path, str) or not path.startswith("/")):
             raise BridgeProtocolError("scene_snapshot path must be an absolute Houdini node path when provided.")
@@ -1050,8 +1687,152 @@ def validate_command(command: str, payload: dict[str, Any] | None = None) -> Non
             raise BridgeProtocolError("scene_snapshot include_viewport must be boolean when provided.")
         _validate_viewport_payload(payload, "scene_snapshot")
 
+    if normalized == "scene_diff":
+        if not isinstance(payload.get("before"), dict) or not isinstance(payload.get("after"), dict):
+            raise BridgeProtocolError("scene_diff requires before and after objects.")
+        include_parms = payload.get("include_parms", False)
+        if not isinstance(include_parms, bool):
+            raise BridgeProtocolError("scene_diff include_parms must be boolean when provided.")
+        max_changes = payload.get("max_changes", 200)
+        if not isinstance(max_changes, int) or max_changes < 1 or max_changes > 1000:
+            raise BridgeProtocolError("scene_diff max_changes must be an integer between 1 and 1000.")
+
+    if normalized == "list_node_types":
+        category = payload.get("category")
+        if category is not None and not isinstance(category, str):
+            raise BridgeProtocolError("list_node_types category must be a string when provided.")
+        name = payload.get("name")
+        if name is not None and not isinstance(name, str):
+            raise BridgeProtocolError("list_node_types name must be a string when provided.")
+        limit = payload.get("limit", 100)
+        if not isinstance(limit, int) or limit < 1 or limit > 500:
+            raise BridgeProtocolError("list_node_types limit must be an integer between 1 and 500.")
+        offset = payload.get("offset", 0)
+        if not isinstance(offset, int) or offset < 0 or offset > 100000:
+            raise BridgeProtocolError("list_node_types offset must be an integer between 0 and 100000.")
+        refresh = payload.get("refresh", False)
+        if not isinstance(refresh, bool):
+            raise BridgeProtocolError("list_node_types refresh must be boolean when provided.")
+
+    if normalized == "get_houdini_help":
+        help_type = payload.get("help_type", "node")
+        if help_type not in {"node", "expression", "hscript", "python", "general"}:
+            raise BridgeProtocolError("get_houdini_help help_type must be node, expression, hscript, python, or general.")
+        item_name = payload.get("item_name", "")
+        if item_name is not None and not isinstance(item_name, str):
+            raise BridgeProtocolError("get_houdini_help item_name must be a string when provided.")
+        category = payload.get("category")
+        if category is not None and not isinstance(category, str):
+            raise BridgeProtocolError("get_houdini_help category must be a string when provided.")
+        limit = payload.get("limit", 20)
+        if not isinstance(limit, int) or limit < 1 or limit > 100:
+            raise BridgeProtocolError("get_houdini_help limit must be an integer between 1 and 100.")
+        offset = payload.get("offset", 0)
+        if not isinstance(offset, int) or offset < 0 or offset > 100000:
+            raise BridgeProtocolError("get_houdini_help offset must be an integer between 0 and 100000.")
+        fetch = payload.get("fetch", False)
+        if not isinstance(fetch, bool):
+            raise BridgeProtocolError("get_houdini_help fetch must be boolean when provided.")
+
+    if normalized == "material_info":
+        path = payload.get("path")
+        if path is not None and (not isinstance(path, str) or not path.startswith("/")):
+            raise BridgeProtocolError("material_info path must be an absolute Houdini node path when provided.")
+        root = payload.get("root", "/mat")
+        if not isinstance(root, str) or not root.startswith("/"):
+            raise BridgeProtocolError("material_info root must be an absolute Houdini node path.")
+        limit = payload.get("limit", 100)
+        if not isinstance(limit, int) or limit < 1 or limit > 500:
+            raise BridgeProtocolError("material_info limit must be an integer between 1 and 500.")
+
+    if normalized == "multi_read":
+        steps = payload.get("steps")
+        if not isinstance(steps, list) or not steps or len(steps) > 20:
+            raise BridgeProtocolError("multi_read requires 1 to 20 read steps.")
+        continue_on_error = payload.get("continue_on_error", True)
+        if not isinstance(continue_on_error, bool):
+            raise BridgeProtocolError("multi_read continue_on_error must be boolean when provided.")
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                raise BridgeProtocolError("multi_read step %s must be a JSON object." % index)
+            step_command = normalize_command(step.get("command"))
+            if step_command not in MULTI_READ_ALLOWED_COMMANDS:
+                raise BridgeProtocolError("multi_read step %s command is not an allowed safe read: %s" % (index, step_command))
+            step_payload = step.get("payload", {}) or {}
+            if not isinstance(step_payload, dict):
+                raise BridgeProtocolError("multi_read step %s payload must be a JSON object." % index)
+            validate_command(step_command, step_payload)
+
     if normalized == "viewport_screenshot":
+        for key in ("target", "camera"):
+            if key in payload and (not isinstance(payload[key], str) or not payload[key].startswith("/")):
+                raise BridgeProtocolError("%s must be an absolute Houdini path." % key)
         _validate_viewport_payload(payload, "viewport_screenshot")
+        if payload.get("frame", "current") not in {"current", "selected", "all"}:
+            raise BridgeProtocolError("viewport_screenshot frame must be current, selected, or all.")
+        if payload.get("view", "current") not in {"current", "front", "right", "top"}:
+            raise BridgeProtocolError("viewport_screenshot view must be current, front, right, or top.")
+        timeline_frame = payload.get("timeline_frame")
+        if timeline_frame is not None and (isinstance(timeline_frame, bool) or not isinstance(timeline_frame, (int, float)) or not -100000 <= timeline_frame <= 100000):
+            raise BridgeProtocolError("viewport_screenshot timeline_frame must be a number from -100000 to 100000.")
+
+    if normalized == "list_panes":
+        pane_type = payload.get("type")
+        if pane_type is not None and (not isinstance(pane_type, str) or not _valid_pane_type_name(pane_type)):
+            raise BridgeProtocolError("list_panes type must be a Houdini pane type name.")
+
+    if normalized == "pane_screenshot":
+        pane_type = payload.get("type", "NetworkEditor")
+        if not isinstance(pane_type, str) or not _valid_pane_type_name(pane_type):
+            raise BridgeProtocolError("pane_screenshot type must be a Houdini pane type name.")
+        fit = payload.get("fit", False)
+        if not isinstance(fit, bool):
+            raise BridgeProtocolError("pane_screenshot fit must be boolean when provided.")
+        prefix = payload.get("prefix", "pane")
+        if not isinstance(prefix, str) or not _valid_filename_prefix(prefix):
+            raise BridgeProtocolError("pane_screenshot prefix must contain only letters, numbers, dot, dash, or underscore.")
+
+    if normalized == "capture_multiple_panes":
+        types = payload.get("types", ["NetworkEditor", "SceneViewer", "Parm"])
+        if not isinstance(types, list) or not types or len(types) > 8:
+            raise BridgeProtocolError("capture_multiple_panes types must be a non-empty list with at most 8 entries.")
+        for pane_type in types:
+            if not isinstance(pane_type, str) or not _valid_pane_type_name(pane_type):
+                raise BridgeProtocolError("capture_multiple_panes types entries must be Houdini pane type names.")
+        fit = payload.get("fit", False)
+        if not isinstance(fit, bool):
+            raise BridgeProtocolError("capture_multiple_panes fit must be boolean when provided.")
+        prefix = payload.get("prefix", "panes")
+        if not isinstance(prefix, str) or not _valid_filename_prefix(prefix):
+            raise BridgeProtocolError("capture_multiple_panes prefix must contain only letters, numbers, dot, dash, or underscore.")
+
+    if normalized == "network_screenshot":
+        path = payload.get("path", "/obj")
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise BridgeProtocolError("network_screenshot path must be an absolute Houdini node path.")
+        fit = payload.get("fit", True)
+        if not isinstance(fit, bool):
+            raise BridgeProtocolError("network_screenshot fit must be boolean when provided.")
+        prefix = payload.get("prefix", "network")
+        if not isinstance(prefix, str) or not _valid_filename_prefix(prefix):
+            raise BridgeProtocolError("network_screenshot prefix must contain only letters, numbers, dot, dash, or underscore.")
+
+    if normalized in {"network_screenshot", "pane_screenshot"} and "restore" in payload and not isinstance(payload["restore"], bool):
+        raise BridgeProtocolError("restore must be boolean.")
+
+    if normalized == "render_info":
+        root = payload.get("root")
+        if root is not None and (not isinstance(root, str) or not root.startswith("/")):
+            raise BridgeProtocolError("render_info root must be an absolute Houdini node path when provided.")
+        limit = payload.get("limit", 100)
+        if not isinstance(limit, int) or limit < 1 or limit > 200:
+            raise BridgeProtocolError("render_info limit must be an integer between 1 and 200.")
+        offset = payload.get("offset", 0)
+        if not isinstance(offset, int) or offset < 0 or offset > 100000:
+            raise BridgeProtocolError("render_info offset must be an integer between 0 and 100000.")
+        include_parms = payload.get("include_parms", True)
+        if not isinstance(include_parms, bool):
+            raise BridgeProtocolError("render_info include_parms must be boolean when provided.")
 
     if normalized in {"validate_plan", "review_plan", "run_plan", "verify_plan"}:
         steps = payload.get("steps")
@@ -1077,6 +1858,8 @@ def validate_command(command: str, payload: dict[str, Any] | None = None) -> Non
                 if key in payload and not isinstance(payload.get(key), dict):
                     raise BridgeProtocolError("verify_plan %s must be an object when provided." % key)
         if normalized == "run_plan":
+            if "expected_context" in payload and (not isinstance(payload["expected_context"], str) or len(payload["expected_context"]) != 64):
+                raise BridgeProtocolError("expected_context must be a 64-character context token.")
             continue_on_error = payload.get("continue_on_error", False)
             if not isinstance(continue_on_error, bool):
                 raise BridgeProtocolError("run_plan continue_on_error must be boolean when provided.")
@@ -1331,7 +2114,7 @@ def command_manifest() -> dict[str, Any]:
 def safety_policy() -> dict[str, Any]:
     return {
         "version": 1,
-        "summary": "Local-only bridge control with read/default, edit-mode gate, direct low-risk edits, and plan-required high-risk edits.",
+        "summary": "Local-only bridge control with an editable default and a Houdini-side read-only switch.",
         "transport": {
             "host": "127.0.0.1",
             "session_file_required": True,
@@ -1340,7 +2123,7 @@ def safety_policy() -> dict[str, Any]:
             "mcp_calls_bridge_rpc_only": True,
         },
         "edit_gate": {
-            "default_mode": "read",
+            "default_mode": "edit",
             "houdini_edit_mode_required": True,
             "direct_edit_commands": sorted(DIRECT_EDIT_COMMANDS),
             "direct_edit_verification": direct_edit_verification_contracts(),
@@ -1348,14 +2131,11 @@ def safety_policy() -> dict[str, Any]:
             "plan_transaction_command": "run_plan",
             "required_plan_flow": ["review_plan", "validate_plan", "run_plan", "verify_plan"],
         },
+        "trusted_python": {"default_enabled": True, "requires_houdini_python_on": False, "requires_edit_mode": True, "arbitrary_python": True, "sandboxed": False, "warning": "Python runs with full Houdini process permissions, including filesystem, network, and shell access."},
         "blocked": {
             "danger_commands": sorted(DANGER_COMMANDS),
             "rules": [
-                "No shell command execution.",
-                "No arbitrary Python or HScript execution.",
-                "No HIP save/load operations.",
-                "No arbitrary file writes or file opens.",
-                "No package installation.",
+                "Editable mode includes arbitrary Python with Houdini process privileges.",
             ],
         },
         "evidence": {
@@ -1455,6 +2235,10 @@ def _valid_filename_prefix(value: str) -> bool:
     return bool(value) and len(value) <= 64 and all(ch.isalnum() or ch in "._-" for ch in value)
 
 
+def _valid_pane_type_name(value: str) -> bool:
+    return bool(value) and len(value) <= 64 and all(ch.isalnum() or ch == "_" for ch in value)
+
+
 def _require_number(payload: dict[str, Any], key: str, command: str) -> None:
     value = payload.get(key)
     if not isinstance(value, (int, float)):
@@ -1499,3 +2283,20 @@ def _validate_viewport_payload(payload: dict[str, Any], command: str) -> None:
     prefix = payload.get("prefix", "viewport")
     if not isinstance(prefix, str) or not _valid_filename_prefix(prefix):
         raise BridgeProtocolError("%s prefix must contain only letters, numbers, dot, dash, or underscore." % command)
+
+
+# Task-only host workflows; intentionally absent from the legacy direct MCP surface.
+COMMANDS.update({
+    "edit_batch": {"permission": "edit", "description": "Guarded ordinary edit with structural readback and an optional preview as one durable task."},
+    "inspect_batch": {"permission": "read", "description": "Bounded target inspection as one durable task."},
+})
+COMMAND_PAYLOAD_SCHEMAS.update({
+    "edit_batch": {"type": "object", "required": ["steps", "expected_context"], "properties": {
+        "steps": {"type": "array", "maxItems": 100}, "expected_context": {"type": "string"},
+        "details": {"type": "boolean"}, "preview": {"type": "object"}}},
+    "inspect_batch": {"type": "object", "properties": {"targets": {"type": "array", "maxItems": 20},
+        "kind": {"type": "string"}, "cook": {"type": "boolean"}, "expected_context": {"type": "string"}}},
+})
+
+COMMANDS["look_batch"] = {"permission": "read", "description": "Temporary viewport/network captures as one queryable task."}
+COMMAND_PAYLOAD_SCHEMAS["look_batch"] = {"type": "object"}

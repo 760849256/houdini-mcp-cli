@@ -310,7 +310,7 @@ def _blockers_from_validation(validation: dict[str, Any]) -> list[str]:
 def _review_warnings(steps: list[dict[str, Any]], validation: dict[str, Any], impact: dict[str, list[str]]) -> list[str]:
     warnings: list[str] = []
     commands = [_command_name(step) for step in steps]
-    edit_count = sum(1 for name in commands if name not in {"health", "manifest", "context", "selected", "scene_snapshot", "find_nodes", "node_info", "node_parms", "profile_manifest", "probe_parm_profile", "rpc_log", "network", "upstream", "downstream", "edit_mode", "validate_plan", "recipe_manifest", "review_plan"})
+    edit_count = sum(1 for name in commands if name not in {"health", "manifest", "context", "diagnostic_bundle", "selected", "scene_snapshot", "scene_diff", "find_nodes", "node_info", "node_parms", "parameter_schema", "geometry_summary", "find_error_nodes", "get_houdini_help", "list_node_types", "material_info", "multi_read", "list_panes", "pane_screenshot", "capture_multiple_panes", "network_screenshot", "render_info", "profile_manifest", "probe_parm_profile", "rpc_log", "network", "upstream", "downstream", "edit_mode", "validate_plan", "recipe_manifest", "review_plan", "verify_plan"})
     if edit_count >= 3 and "layout" not in commands:
         warnings.append("Plan creates or edits multiple nodes but has no layout step.")
     if commands.count("connect") >= 3:
@@ -347,7 +347,9 @@ def _required_confirmations(steps: list[dict[str, Any]]) -> list[str]:
                 parm_names = [str(item) for item in (payload.get("values", {}) or {}).keys()]
             if command == "apply_parm_profile":
                 parm_names = [str(payload.get("profile", ""))]
-            if any(name in {"file", "path", "soppath", "output", "output_name", "sopoutput"} for name in parm_names) or payload.get("value") in {"", None}:
+            value = payload.get("value")
+            blank_value = command in {"set_parm", "set_parm_any"} and (value is None or value == "")
+            if any(name in {"file", "path", "soppath", "output", "output_name", "sopoutput"} for name in parm_names) or blank_value:
                 confirmations.append("Step %s set_parm touches an output/path-like value." % index)
         if command == "create_node" and "filecache" in str(payload.get("type", "")).lower():
             confirmations.append("Step %s creates a cache node; confirm cache path and frame range." % index)

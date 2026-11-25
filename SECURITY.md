@@ -16,9 +16,11 @@ not be exposed to a network.
 
 ## Explicitly Out Of Scope
 
-The bridge does not provide shell execution, arbitrary Python execution, package
-installation, HIP file save/load, or unrestricted file writes through the public
-RPC command surface.
+Direct commands for shell execution, HIP file operations, and file writes remain blocked.
+The editable startup mode includes `python_submit`. Submitted code runs in
+Houdini with full process privileges. The local **只读** switch disables
+scene writes and Python together and invalidates queued write tasks.
+Already running code can complete or exit through a cooperative checkpoint.
 
 ## Reporting Issues
 
@@ -29,6 +31,6 @@ file paths, or exploit details in the public issue.
 
 ## Operator Guidance
 
-Keep edit mode off unless you intend to allow writes. After using an AI client
-or an external automation, return the bridge to read-only mode with the Houdini
-`Edit Off` shelf tool.
+Control access with **只读** in the Houdini Bridge panel. The client can
+inspect the access mode or reduce it to read-only. Restoring editable mode
+is a local Houdini action.

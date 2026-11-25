@@ -39,19 +39,34 @@ def _load_tool_module(name):
 
 
 class FakeCategory:
+    def __init__(self, name="Sop", node_types=None):
+        self._name = name
+        self._node_types = node_types or {}
+
     def name(self):
-        return "Sop"
+        return self._name
+
+    def nodeTypes(self):
+        return self._node_types
 
 
 class FakeType:
-    def __init__(self, name):
+    def __init__(self, name, category=None, description=""):
         self._name = name
+        self._category = category or FakeCategory()
+        self._description = description or ("%s node" % name)
 
     def name(self):
         return self._name
 
     def category(self):
-        return FakeCategory()
+        return self._category
+
+    def description(self):
+        return self._description
+
+    def sourcePath(self):
+        return ""
 
 
 class FakeParmType:
@@ -69,12 +84,27 @@ class FakeParmTemplate:
     def type(self):
         return FakeParmType()
 
+    def defaultValue(self):
+        return (0.0,)
+
+    def minValue(self):
+        return -10.0
+
+    def maxValue(self):
+        return 10.0
+
+    def minIsStrict(self):
+        return False
+
+    def maxIsStrict(self):
+        return False
+
 
 class FakeParm:
-    def __init__(self, name, label):
+    def __init__(self, name, label, value=1.25):
         self._name = name
         self._label = label
-        self.value = 1.25
+        self.value = value
 
     def name(self):
         return self._name
@@ -102,6 +132,80 @@ class FakeParm:
 
     def keyframes(self):
         return []
+
+
+class FakeAttribType:
+    def __init__(self, name):
+        self._name = name
+
+    def name(self):
+        return self._name
+
+
+class FakeAttrib:
+    def __init__(self, name, data_type="Float", size=1):
+        self._name = name
+        self._data_type = FakeAttribType(data_type)
+        self._size = size
+
+    def name(self):
+        return self._name
+
+    def dataType(self):
+        return self._data_type
+
+    def size(self):
+        return self._size
+
+
+class FakeGroup:
+    def __init__(self, name, size):
+        self._name = name
+        self._entries = list(range(size))
+
+    def name(self):
+        return self._name
+
+    def entries(self):
+        return self._entries
+
+
+class FakeBoundingBox:
+    def minvec(self):
+        return (0.0, 0.0, 0.0)
+
+    def maxvec(self):
+        return (1.0, 2.0, 3.0)
+
+
+class FakeGeometry:
+    def intrinsicValue(self, name):
+        return {
+            "pointcount": 8,
+            "primitivecount": 6,
+            "vertexcount": 24,
+        }.get(name)
+
+    def boundingBox(self):
+        return FakeBoundingBox()
+
+    def pointAttribs(self):
+        return [FakeAttrib("P", "Float", 3), FakeAttrib("Cd", "Float", 3)]
+
+    def primAttribs(self):
+        return [FakeAttrib("name", "String", 1)]
+
+    def vertexAttribs(self):
+        return []
+
+    def globalAttribs(self):
+        return [FakeAttrib("shop_materialpath", "String", 1)]
+
+    def pointGroups(self):
+        return [FakeGroup("pin", 2)]
+
+    def primGroups(self):
+        return [FakeGroup("inside", 3)]
 
 
 class FakeParmTemplateGroup:
@@ -166,6 +270,9 @@ class FakeStickyNote:
 
 
 class FakeNode:
+    def sessionId(self):
+        return id(self)
+
     def __init__(self, path, type_name="null", parent=None):
         self._path = path
         self._type = FakeType(type_name)
@@ -187,6 +294,8 @@ class FakeNode:
         self._network_boxes = []
         self._sticky_notes = []
         self._destroyed = False
+        self._errors = []
+        self._warnings = []
 
     def path(self):
         return self._path
@@ -225,10 +334,13 @@ class FakeNode:
         return self._selected or self._path.endswith("OUT")
 
     def errors(self):
-        return []
+        return self._errors
 
     def warnings(self):
-        return []
+        return self._warnings
+
+    def geometry(self):
+        return FakeGeometry()
 
     def networkBoxes(self):
         return self._network_boxes
@@ -416,22 +528,112 @@ class FakeViewport:
             handle.write(b"fake-png")
 
 
+class FakePaneGeometry:
+    def x(self):
+        return 10
+
+    def y(self):
+        return 20
+
+    def width(self):
+        return 640
+
+    def height(self):
+        return 360
+
+
+class FakePaneType:
+    def __init__(self, name):
+        self._name = name
+
+    def name(self):
+        return self._name
+
+
 class FakeSceneViewer:
     def __init__(self):
         self.viewport = FakeViewport()
+        self._home_all = False
 
     def curViewport(self):
         return self.viewport
+
+    def name(self):
+        return "scene1"
+
+    def type(self):
+        return FakePaneType("SceneViewer")
+
+    def qtScreenGeometry(self):
+        return FakePaneGeometry()
+
+    def homeAll(self):
+        self._home_all = True
+
+    def saveScreenshot(self, path):
+        with open(path, "wb") as handle:
+            handle.write(b"fake-scene-pane")
+
+
+class FakeNetworkEditor:
+    def __init__(self):
+        self._pwd = None
+        self._pwd_node = None
+        self._home_all = False
+
+    def name(self):
+        return "network1"
+
+    def type(self):
+        return FakePaneType("NetworkEditor")
+
+    def qtScreenGeometry(self):
+        return FakePaneGeometry()
+
+    def setPwd(self, node):
+        self._pwd_node = node
+        self._pwd = node.path()
+
+    def pwd(self):
+        return self._pwd_node
+
+    def homeAll(self):
+        self._home_all = True
+
+    def saveScreenshot(self, path):
+        with open(path, "wb") as handle:
+            handle.write(b"fake-network-pane")
+
+
+class FakeDesktop:
+    def __init__(self, panes):
+        self._panes = panes
+
+    def name(self):
+        return "Build"
+
+    def paneTabs(self):
+        return self._panes
 
 
 class FakeUI:
     def __init__(self):
         self.scene_viewer = FakeSceneViewer()
+        self.network_editor = FakeNetworkEditor()
+        self.desktop = FakeDesktop([self.scene_viewer, self.network_editor])
 
     def paneTabOfType(self, pane_type):
         if pane_type == "SceneViewer":
             return self.scene_viewer
+        if pane_type == "NetworkEditor":
+            return self.network_editor
         return None
+
+    def curDesktop(self):
+        return self.desktop
+
+    def desktops(self):
+        return [self.desktop]
 
 
 class FakeHou:
@@ -467,18 +669,44 @@ class FakeHou:
         self.box = FakeNode("/obj/geo1/box1", "box", self.geo)
         self.out = FakeNode("/obj/geo1/OUT", "null", self.geo)
         self.wrangle = FakeNode("/obj/geo1/set_pscale1", "attribwrangle", self.geo)
+        self.mat_root = FakeNode("/mat", "mat")
+        self.material = FakeNode("/mat/test_mat", "principledshader", self.mat_root)
+        self.material._parms.append(FakeParm("basecolor_texture", "Base Color Texture", "D:/tex/diffuse.exr"))
+        self.out_root = FakeNode("/out", "out")
+        self.render = FakeNode("/out/karma1", "usdrender_rop", self.out_root)
+        self.render._parms.extend(
+            [
+                FakeParm("camera", "Camera", "/obj/cam1"),
+                FakeParm("picture", "Output Picture", "$HIP/render/test.$F4.exr"),
+                FakeParm("renderer", "Renderer", "Karma XPU"),
+                FakeParm("resx", "Resolution X", 1280),
+                FakeParm("resy", "Resolution Y", 720),
+                FakeParm("samples", "Samples", 32),
+                FakeParm("f1", "Start Frame", 1001),
+                FakeParm("f2", "End Frame", 1010),
+            ]
+        )
+        self.stage_root = FakeNode("/stage", "lopnet")
         self.root._children = [self.geo]
         self.out._inputs = [self.box]
         self.box._outputs = [self.out]
         self.wrangle._inputs = [self.out]
         self.out._outputs = [self.wrangle]
         self.geo._children = [self.box, self.out, self.wrangle]
+        self.mat_root._children = [self.material]
+        self.out_root._children = [self.render]
+        self.ui.network_editor.setPwd(self.geo)
         self.nodes = {
             "/obj": self.root,
             "/obj/geo1": self.geo,
             "/obj/geo1/box1": self.box,
             "/obj/geo1/OUT": self.out,
             "/obj/geo1/set_pscale1": self.wrangle,
+            "/mat": self.mat_root,
+            "/mat/test_mat": self.material,
+            "/out": self.out_root,
+            "/out/karma1": self.render,
+            "/stage": self.stage_root,
         }
 
     def selectedNodes(self):
@@ -493,7 +721,7 @@ class FakeHou:
 
     def _refresh_nodes(self):
         nodes = {}
-        stack = [self.root]
+        stack = [self.root, self.mat_root, self.out_root, self.stage_root]
         while stack:
             node = stack.pop(0)
             if node._destroyed:
@@ -510,6 +738,40 @@ class FakeHou:
 
     def pwd(self):
         return self.geo
+
+    def nodeTypeCategories(self):
+        sop_category = FakeCategory("Sop")
+        mat_category = FakeCategory("Vop")
+        driver_category = FakeCategory("Driver")
+        lop_category = FakeCategory("Lop")
+        return {
+            "Sop": FakeCategory(
+                "Sop",
+                {
+                    "box": FakeType("box", sop_category, "Box SOP"),
+                    "attribwrangle": FakeType("attribwrangle", sop_category, "Attribute Wrangle SOP"),
+                },
+            ),
+            "Vop": FakeCategory(
+                "Vop",
+                {
+                    "principledshader": FakeType("principledshader", mat_category, "Principled Shader material"),
+                    "mtlxstandard_surface": FakeType("mtlxstandard_surface", mat_category, "MaterialX Standard Surface"),
+                },
+            ),
+            "Driver": FakeCategory(
+                "Driver",
+                {
+                    "usdrender_rop": FakeType("usdrender_rop", driver_category, "USD Render ROP"),
+                },
+            ),
+            "Lop": FakeCategory(
+                "Lop",
+                {
+                    "karmarendersettings": FakeType("karmarendersettings", lop_category, "Karma Render Settings"),
+                },
+            ),
+        }
 
 
 class FakeShelfUI:
@@ -566,6 +828,16 @@ class BlibHouBridgeTests(unittest.TestCase):
         self.assertEqual(result["commands"]["manifest"]["permission"], "read")
         self.assertEqual(result["commands"]["manifest"]["exposure"], "read")
         self.assertEqual(result["commands"]["scene_snapshot"]["permission"], "read")
+        self.assertEqual(result["commands"]["diagnostic_bundle"]["permission"], "read")
+        self.assertEqual(result["commands"]["parameter_schema"]["permission"], "read")
+        self.assertEqual(result["commands"]["geometry_summary"]["permission"], "read")
+        self.assertEqual(result["commands"]["get_houdini_help"]["permission"], "read")
+        self.assertEqual(result["commands"]["list_node_types"]["permission"], "read")
+        self.assertEqual(result["commands"]["material_info"]["permission"], "read")
+        self.assertEqual(result["commands"]["multi_read"]["permission"], "read")
+        self.assertEqual(result["commands"]["render_info"]["permission"], "read")
+        self.assertEqual(result["commands"]["scene_diff"]["permission"], "read")
+        self.assertEqual(result["commands"]["find_error_nodes"]["permission"], "read")
         scene_result_schema = result["commands"]["scene_snapshot"]["result_schema"]
         self.assertIn("focus_candidates", scene_result_schema["properties"]["semantics"]["properties"])
         self.assertIn("inspection_hints", scene_result_schema["properties"]["semantics"]["properties"])
@@ -586,6 +858,11 @@ class BlibHouBridgeTests(unittest.TestCase):
         validate_result_schema = result["commands"]["validate_plan"]["result_schema"]
         for key in ("valid", "ready_to_run", "would_require_edit", "blocked_by_edit_mode", "step_count", "steps_sha256", "steps"):
             self.assertIn(key, validate_result_schema["properties"])
+        self.assertIn("response_meta", result["commands"]["list_node_types"]["result_schema"]["properties"])
+        self.assertIn("response_meta", result["commands"]["multi_read"]["result_schema"]["properties"])
+        self.assertIn("response_meta", result["commands"]["find_nodes"]["result_schema"]["properties"])
+        self.assertIn("fields", result["commands"]["node_info"]["payload_schema"]["properties"])
+        self.assertIn("fields", result["commands"]["diagnostic_bundle"]["payload_schema"]["properties"])
         review_result_schema = result["commands"]["review_plan"]["result_schema"]
         for key in ("level", "confidence", "blockers", "warnings", "suggestions", "impact", "risk_notes", "required_confirmations"):
             self.assertIn(key, review_result_schema["properties"])
@@ -659,8 +936,22 @@ class BlibHouBridgeTests(unittest.TestCase):
         self.assertNotIn("maxItems", result["commands"]["validate_plan"]["payload_schema"]["properties"]["steps"])
         self.assertNotIn("maxItems", result["commands"]["review_plan"]["payload_schema"]["properties"]["steps"])
         self.assertEqual(result["commands"]["find_nodes"]["payload_schema"]["required"], ["root"])
+        self.assertEqual(result["commands"]["find_error_nodes"]["payload_schema"]["required"], ["root"])
+        self.assertEqual(result["commands"]["list_panes"]["permission"], "read")
+        self.assertEqual(result["commands"]["pane_screenshot"]["permission"], "read")
+        self.assertEqual(result["commands"]["capture_multiple_panes"]["permission"], "read")
+        self.assertEqual(result["commands"]["network_screenshot"]["permission"], "read")
+        self.assertNotIn("required", result["commands"]["list_panes"]["payload_schema"])
+        self.assertNotIn("required", result["commands"]["pane_screenshot"]["payload_schema"])
         self.assertEqual(result["commands"]["set_flags"]["payload_schema"]["required"], ["node"])
         self.assertEqual(result["commands"]["node_parms"]["payload_schema"]["required"], ["path"])
+        self.assertEqual(result["commands"]["parameter_schema"]["payload_schema"]["required"], ["path"])
+        self.assertEqual(result["commands"]["geometry_summary"]["payload_schema"]["required"], ["path"])
+        self.assertNotIn("required", result["commands"]["diagnostic_bundle"]["payload_schema"])
+        self.assertEqual(result["commands"]["scene_diff"]["payload_schema"]["required"], ["before", "after"])
+        self.assertNotIn("required", result["commands"]["get_houdini_help"]["payload_schema"])
+        self.assertEqual(result["commands"]["multi_read"]["payload_schema"]["required"], ["steps"])
+        self.assertNotIn("required", result["commands"]["render_info"]["payload_schema"])
         self.assertEqual(result["commands"]["run_plan"]["payload_schema"]["required"], ["steps"])
         self.assertEqual(result["commands"]["apply_parm_profile"]["payload_schema"]["required"], ["node", "profile"])
         self.assertEqual(result["commands"]["probe_parm_profile"]["payload_schema"]["required"], ["node", "profile"])
@@ -693,8 +984,11 @@ class BlibHouBridgeTests(unittest.TestCase):
         self.assertEqual(catalog["version"], 1)
         self.assertIn("sop-cleanup", catalog["template_names"])
         self.assertIn("karma-solaris-preview", catalog["template_names"])
+        self.assertIn("material-create-preview", catalog["template_names"])
+        self.assertIn("material-assign-preview", catalog["template_names"])
         self.assertEqual(catalog["templates"]["sop-cleanup"]["category"], "cleanup")
         self.assertEqual(catalog["templates"]["karma-solaris-preview"]["category"], "render")
+        self.assertEqual(catalog["templates"]["material-create-preview"]["category"], "material")
         self.assertEqual(catalog["workflow_policy"]["required_flow"], workflow_templates.TEMPLATE_REQUIRED_FLOW)
         self.assertTrue(catalog["workflow_policy"]["local_generation_only"])
         self.assertTrue(catalog["workflow_policy"]["does_not_execute"])
@@ -706,6 +1000,8 @@ class BlibHouBridgeTests(unittest.TestCase):
         self.assertIn("houdini_node_parms", catalog["templates"]["rbd-preview"]["verification_focus"]["read_tools"])
         self.assertIn("simulation_nodes_exist", catalog["templates"]["rbd-preview"]["verification_focus"]["success_criteria"])
         self.assertIn("no_render_execution_claimed", catalog["templates"]["karma-solaris-preview"]["verification_focus"]["success_criteria"])
+        self.assertIn("houdini_material_info", catalog["templates"]["material-create-preview"]["verification_focus"]["read_tools"])
+        self.assertIn("material_node_exists", catalog["templates"]["material-create-preview"]["verification_focus"]["success_criteria"])
         self.assertIn("default_karma_render_path", catalog)
         self.assertIn("preview", catalog["presets"])
         catalog["presets"]["preview"]["cleanup"]["fuse_distance"] = 99
@@ -786,6 +1082,32 @@ class BlibHouBridgeTests(unittest.TestCase):
         self.assertTrue(validation["would_require_edit"])
         self.assertEqual(validation["step_count"], len(plan))
 
+    def test_workflow_templates_build_material_plans_without_direct_execution(self):
+        create_plan = workflow_templates.build_plan(
+            "material-create-preview",
+            "/obj/geo1/OUT",
+            {"name": "lookdev", "material_name": "LOOKDEV_MAT", "base_color": [0.2, 0.4, 0.8], "roughness": 0.45, "texture_path": "$HIP/tex/diffuse.exr"},
+        )
+        create_commands = [protocol.normalize_command(step["command"]) for step in create_plan]
+        self.assertEqual(create_commands[0], "create_node")
+        self.assertIn("set_parm_any", create_commands)
+        self.assertEqual(create_plan[-1]["payload"]["path"], "/mat/LOOKDEV_MAT")
+        for step in create_plan:
+            protocol.validate_command(step["command"], step.get("payload", {}))
+
+        assign_plan = workflow_templates.build_plan(
+            "material-assign-preview",
+            "/obj/geo1/OUT",
+            {"name": "lookdev", "material_path": "/mat/LOOKDEV_MAT", "group": "hero", "output_name": "OUT_LOOKDEV"},
+        )
+        assign_commands = [protocol.normalize_command(step["command"]) for step in assign_plan]
+        self.assertIn("connect", assign_commands)
+        self.assertIn("set_parm_any", assign_commands)
+        self.assertEqual(assign_commands[-1], "select")
+        self.assertTrue(any(step.get("payload", {}).get("value") == "/mat/LOOKDEV_MAT" for step in assign_plan))
+        for step in assign_plan:
+            protocol.validate_command(step["command"], step.get("payload", {}))
+
     def test_workflow_templates_use_dynamics_profiles_for_rbd_vellum_pyro(self):
         for template in ("rbd-preview", "vellum-grains-preview", "vellum-cloth-preview", "pyro-source-preview"):
             with self.subTest(template=template):
@@ -858,6 +1180,55 @@ class BlibHouBridgeTests(unittest.TestCase):
         self.assertEqual(parms["parms"][0]["value"], 1.25)
         self.assertFalse(parms["parms"][0]["locked"])
 
+        filtered_parms = commands.execute(
+            "node-parms",
+            {"path": "/obj/geo1/OUT", "parm_names": ["tx"], "limit": 1},
+            hou_module=fake_hou,
+        )
+        self.assertEqual(filtered_parms["parm_count"], 1)
+        self.assertEqual(filtered_parms["available_parm_count"], 1)
+        self.assertEqual(filtered_parms["parms"][0]["name"], "tx")
+        self.assertEqual(filtered_parms["filters"]["parm_names"], ["tx"])
+
+        schema = commands.execute("parameter-schema", {"path": "/obj/geo1/OUT"}, hou_module=fake_hou)
+        self.assertEqual(schema["node"]["path"], "/obj/geo1/OUT")
+        self.assertEqual(schema["parameter_count"], 1)
+        self.assertEqual(schema["parameters"][0]["name"], "tx")
+        self.assertEqual(schema["parameters"][0]["label"], "Translate X")
+        self.assertEqual(schema["parameters"][0]["default_value"], [0.0])
+        self.assertEqual(schema["parameters"][0]["min"], -10.0)
+        self.assertEqual(schema["parameters"][0]["max"], 10.0)
+
+        lean_schema = commands.execute(
+            "parameter-schema",
+            {"path": "/obj/geo1/OUT", "name_contains": "translate", "include_defaults": False, "include_menu": False, "include_ranges": False},
+            hou_module=fake_hou,
+        )
+        self.assertEqual(lean_schema["parameter_count"], 1)
+        self.assertEqual(lean_schema["parameters"][0]["name"], "tx")
+        self.assertNotIn("default_value", lean_schema["parameters"][0])
+        self.assertNotIn("min", lean_schema["parameters"][0])
+        self.assertEqual(lean_schema["filters"]["name_contains"], "translate")
+
+        geometry = commands.execute("geometry-summary", {"path": "/obj/geo1/OUT"}, hou_module=fake_hou)
+        self.assertTrue(geometry["available"])
+        self.assertEqual(geometry["counts"]["points"], 8)
+        self.assertEqual(geometry["counts"]["primitives"], 6)
+        self.assertEqual(geometry["counts"]["vertices"], 24)
+        self.assertEqual(geometry["bounds"], [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]])
+        self.assertIn({"name": "P", "type": "Float", "size": 3}, geometry["point_attributes"])
+        self.assertIn({"name": "inside", "size": 3}, geometry["primitive_groups"])
+
+        fake_hou.box._errors = ["Missing input"]
+        fake_hou.out._warnings = ["Cache is stale"]
+        issues = commands.execute("find-error-nodes", {"root": "/obj/geo1"}, hou_module=fake_hou)
+        self.assertEqual(issues["count"], 2)
+        self.assertEqual(issues["error_count"], 1)
+        self.assertEqual(issues["warning_count"], 1)
+        issues_by_path = {node["path"]: node for node in issues["nodes"]}
+        self.assertEqual(issues_by_path["/obj/geo1/box1"]["errors"], ["Missing input"])
+        self.assertEqual(issues_by_path["/obj/geo1/OUT"]["warnings"], ["Cache is stale"])
+
     def test_scene_snapshot_bundles_current_network_selection_and_traces(self):
         fake_hou = FakeHou()
         snapshot = commands.execute(
@@ -920,6 +1291,19 @@ class BlibHouBridgeTests(unittest.TestCase):
             ["houdini_review_plan", "houdini_validate_plan", "houdini_run_plan", "houdini_verify_plan"],
         )
         self.assertTrue(suggestions[0]["local_generation_only"])
+
+        summary = commands.execute("scene-snapshot", {"path": "/obj/geo1", "mode": "summary"}, hou_module=fake_hou)
+        self.assertEqual(summary["summary"]["mode"], "summary")
+        self.assertNotIn("selected_details", summary)
+        self.assertNotIn("traces", summary)
+        self.assertEqual(summary["network"]["path"], "/obj/geo1")
+        self.assertIn("primary_risk_domain", summary["semantics"])
+
+        routing = commands.execute("scene-snapshot", {"path": "/obj/geo1", "mode": "routing"}, hou_module=fake_hou)
+        self.assertEqual(routing["summary"]["mode"], "routing")
+        self.assertEqual(routing["selected_details"], [])
+        self.assertEqual(routing["traces"], [])
+        self.assertIn("scene_understanding", routing["semantics"])
 
     def test_scene_snapshot_tolerates_nodes_without_render_flag_api(self):
         fake_hou = FakeHou()
@@ -1053,7 +1437,7 @@ class BlibHouBridgeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             session_path = Path(tmpdir) / "session.json"
 
-            def fake_save_session(host, port, token, path=None, pid=None):
+            def fake_save_session(host, port, token, path=None, pid=None, **metadata):
                 session_path.write_text("{}", encoding="utf-8")
                 return session_path
 
@@ -1133,14 +1517,24 @@ class BlibHouBridgeTests(unittest.TestCase):
         self.assertEqual(blib_hou._protocol_command("profile-manifest"), "profile_manifest")
         self.assertEqual(blib_hou._protocol_command("probe-parm-profile"), "probe_parm_profile")
         self.assertEqual(blib_hou._protocol_command("node-parms"), "node_parms")
+        self.assertEqual(blib_hou._protocol_command("parameter-schema"), "parameter_schema")
         self.assertEqual(blib_hou._protocol_command("rpc-log"), "rpc_log")
         self.assertEqual(blib_hou._protocol_command("node-info"), "node_info")
+        self.assertEqual(blib_hou._protocol_command("diagnostic-bundle"), "diagnostic_bundle")
         self.assertEqual(blib_hou._protocol_command("scene-snapshot"), "scene_snapshot")
+        self.assertEqual(blib_hou._protocol_command("scene-diff"), "scene_diff")
+        self.assertEqual(blib_hou._protocol_command("get-houdini-help"), "get_houdini_help")
+        self.assertEqual(blib_hou._protocol_command("houdini-help"), "get_houdini_help")
+        self.assertEqual(blib_hou._protocol_command("list-node-types"), "list_node_types")
+        self.assertEqual(blib_hou._protocol_command("material-info"), "material_info")
+        self.assertEqual(blib_hou._protocol_command("multi-read"), "multi_read")
+        self.assertEqual(blib_hou._protocol_command("render-info"), "render_info")
         self.assertEqual(blib_hou._protocol_command("validate-plan"), "validate_plan")
         self.assertEqual(blib_hou._protocol_command("recipe-manifest"), "recipe_manifest")
         self.assertEqual(blib_hou._protocol_command("review-plan"), "review_plan")
         self.assertEqual(blib_hou._protocol_command("verify-plan"), "verify_plan")
         self.assertEqual(blib_hou._protocol_command("viewport-screenshot"), "viewport_screenshot")
+        self.assertEqual(blib_hou._protocol_command("capture-multiple-panes"), "capture_multiple_panes")
 
     def test_cli_doctor_reports_missing_session(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1187,6 +1581,10 @@ class BlibHouBridgeTests(unittest.TestCase):
         with self.assertRaises(protocol.BridgeProtocolError):
             protocol.make_request("node-parms", {"path": "obj/geo1"})
         with self.assertRaises(protocol.BridgeProtocolError):
+            protocol.make_request("node-parms", {"path": "/obj/geo1", "limit": 0})
+        with self.assertRaises(protocol.BridgeProtocolError):
+            protocol.make_request("parameter-schema", {"path": "/obj/geo1", "include_menu": "yes"})
+        with self.assertRaises(protocol.BridgeProtocolError):
             protocol.make_request("rpc-log", {"limit": 999})
         with self.assertRaises(protocol.BridgeProtocolError):
             protocol.make_request("upstream", {"path": "/obj/geo1/OUT", "depth": 99})
@@ -1196,6 +1594,8 @@ class BlibHouBridgeTests(unittest.TestCase):
             protocol.make_request("scene-snapshot", {"path": "obj/geo1"})
         with self.assertRaises(protocol.BridgeProtocolError):
             protocol.make_request("scene-snapshot", {"trace_depth": 99})
+        with self.assertRaises(protocol.BridgeProtocolError):
+            protocol.make_request("scene-snapshot", {"mode": "fast"})
         request = protocol.make_request(
             "validate-plan",
             {"steps": [{"command": "context", "payload": {}}]},
@@ -1295,6 +1695,197 @@ class BlibHouBridgeTests(unittest.TestCase):
         self.assertIn(os.path.join("blib_hou_bridge", "screenshots"), result["path"])
         self.assertEqual(result["width"], 640)
         self.assertEqual(result["height"], 480)
+
+    def test_pane_screenshot_tools_are_readonly_and_restricted_to_temp_output(self):
+        self.assertIn("list_panes", protocol.READ_COMMANDS)
+        self.assertIn("pane_screenshot", protocol.READ_COMMANDS)
+        self.assertIn("capture_multiple_panes", protocol.READ_COMMANDS)
+        self.assertIn("network_screenshot", protocol.READ_COMMANDS)
+        with self.assertRaises(protocol.BridgeProtocolError):
+            protocol.make_request("pane-screenshot", {"type": "NetworkEditor/Bad"})
+        with self.assertRaises(protocol.BridgeProtocolError):
+            protocol.make_request("pane-screenshot", {"prefix": "../bad"})
+        with self.assertRaises(protocol.BridgeProtocolError):
+            protocol.make_request("network-screenshot", {"path": "obj"})
+
+        fake_hou = FakeHou()
+        panes = commands.execute("list-panes", {}, hou_module=fake_hou)
+        self.assertGreaterEqual(panes["capturable_count"], 2)
+        self.assertIn("NetworkEditor", panes["available_types"])
+        self.assertTrue(any(pane["type"] == "NetworkEditor" for pane in panes["panes"]))
+
+        pane_result = commands.execute(
+            "pane-screenshot",
+            {"type": "NetworkEditor", "prefix": "pane_unit", "fit": True},
+            hou_module=fake_hou,
+        )
+        self.assertTrue(os.path.exists(pane_result["path"]))
+        self.assertIn(os.path.join("blib_hou_bridge", "screenshots"), pane_result["path"])
+        self.assertEqual(pane_result["pane_type"], "NetworkEditor")
+        self.assertEqual(fake_hou.ui.network_editor._home_all, True)
+
+        network_result = commands.execute(
+            "network-screenshot",
+            {"path": "/obj/geo1", "prefix": "network_unit", "fit": True},
+            hou_module=fake_hou,
+        )
+        self.assertTrue(os.path.exists(network_result["path"]))
+        self.assertEqual(network_result["node_path"], "/obj/geo1")
+        self.assertEqual(fake_hou.ui.network_editor._pwd, "/obj/geo1")
+        self.assertGreaterEqual(network_result["child_count"], 1)
+
+        multi_result = commands.execute(
+            "capture-multiple-panes",
+            {"types": ["NetworkEditor", "SceneViewer"], "prefix": "multi_unit", "fit": True},
+            hou_module=fake_hou,
+        )
+        self.assertEqual(multi_result["count"], 2)
+        self.assertEqual(multi_result["success_count"], 2)
+        self.assertTrue(all(item["ok"] for item in multi_result["results"]))
+
+    def test_node_type_and_material_info_are_readonly(self):
+        fake_hou = FakeHou()
+        with self.assertRaises(protocol.BridgeProtocolError):
+            protocol.make_request("list-node-types", {"limit": 0})
+        with self.assertRaises(protocol.BridgeProtocolError):
+            protocol.make_request("material-info", {"path": "mat/test"})
+        with self.assertRaises(protocol.BridgeProtocolError):
+            protocol.make_request("get-houdini-help", {"limit": 0})
+        with self.assertRaises(protocol.BridgeProtocolError):
+            protocol.make_request("render-info", {"root": "out"})
+        with self.assertRaises(protocol.BridgeProtocolError):
+            protocol.make_request("node-info", {"path": "/obj/geo1/OUT", "fields": ["bad-field"]})
+        with self.assertRaises(protocol.BridgeProtocolError):
+            protocol.make_request("diagnostic-bundle", {"preset": "unsafe"})
+        with self.assertRaises(protocol.BridgeProtocolError):
+            protocol.make_request("multi-read", {"steps": [{"command": "viewport-screenshot"}]})
+        with self.assertRaises(protocol.BridgeProtocolError):
+            protocol.make_request("multi-read", {"steps": [{"command": "create-node", "payload": {"parent": "/obj", "type": "null"}}]})
+
+        node_types = commands.execute(
+            "list-node-types",
+            {"category": "Sop", "name": "box", "limit": 10, "offset": 0, "refresh": True},
+            hou_module=fake_hou,
+        )
+        self.assertEqual(node_types["count"], 1)
+        self.assertEqual(node_types["pagination"]["total"], 1)
+        self.assertEqual(node_types["response_meta"]["command"], "list_node_types")
+        self.assertFalse(node_types["response_meta"]["truncated"])
+        self.assertEqual(node_types["node_types"][0]["name"], "box")
+        self.assertEqual(node_types["node_types"][0]["category"], "Sop")
+        self.assertTrue(node_types["cache"]["refreshed"])
+
+        material_list = commands.execute("material-info", {"root": "/mat", "limit": 10}, hou_module=fake_hou)
+        self.assertEqual(material_list["mode"], "list")
+        self.assertEqual(material_list["count"], 1)
+        self.assertEqual(material_list["materials"][0]["node"]["path"], "/mat/test_mat")
+
+        material = commands.execute("material-info", {"path": "/mat/test_mat"}, hou_module=fake_hou)
+        self.assertEqual(material["mode"], "single")
+        self.assertEqual(material["material"]["texture_count"], 1)
+        self.assertEqual(material["material"]["texture_paths"][0]["parameter"], "basecolor_texture")
+
+        projected_node = commands.execute("node-info", {"path": "/obj/geo1/OUT", "fields": ["path", "flags.display"]}, hou_module=fake_hou)
+        self.assertEqual(projected_node["path"], "/obj/geo1/OUT")
+        self.assertEqual(projected_node["flags"]["display"], True)
+        self.assertIn("response_meta", projected_node)
+        self.assertTrue(projected_node["response_meta"]["projected"])
+        self.assertNotIn("parms", projected_node)
+
+        help_result = commands.execute("get-houdini-help", {"help_type": "node", "item_name": "box", "category": "Sop"}, hou_module=fake_hou)
+        self.assertEqual(help_result["docs"]["domain"], "sidefx.com")
+        self.assertFalse(help_result["fetch"]["attempted"])
+        self.assertEqual(help_result["matches"][0]["name"], "box")
+
+        render = commands.execute("render-info", {"root": "/out", "limit": 10}, hou_module=fake_hou)
+        self.assertEqual(render["total"], 1)
+        self.assertEqual(render["nodes"][0]["node"]["path"], "/out/karma1")
+        self.assertEqual(render["nodes"][0]["settings"]["camera"], "/obj/cam1")
+        self.assertEqual(render["nodes"][0]["settings"]["output_path"], "$HIP/render/test.$F4.exr")
+        self.assertEqual(render["nodes"][0]["settings"]["resolution"], [1280, 720])
+        self.assertFalse(render["summary"]["renders_executed"])
+        self.assertEqual(render["response_meta"]["command"], "render_info")
+
+        multi = commands.execute(
+            "multi-read",
+            {
+                "steps": [
+                    {"command": "node-info", "payload": {"path": "/obj/geo1/OUT"}},
+                    {"command": "node-parms", "payload": {"path": "/obj/geo1/OUT"}},
+                    {"command": "render-info", "payload": {"root": "/out", "limit": 5}},
+                ]
+            },
+            hou_module=fake_hou,
+        )
+        self.assertTrue(multi["ok"])
+        self.assertEqual(multi["count"], 3)
+        self.assertEqual(multi["success_count"], 3)
+        self.assertEqual(multi["results"][0]["result"]["path"], "/obj/geo1/OUT")
+        self.assertEqual(multi["results"][2]["result"]["nodes"][0]["node"]["path"], "/out/karma1")
+        self.assertEqual(multi["response_meta"]["command"], "multi_read")
+
+        partial = commands.execute(
+            "multi-read",
+            {
+                "continue_on_error": False,
+                "steps": [
+                    {"command": "node-info", "payload": {"path": "/obj/geo1/OUT"}},
+                    {"command": "node-info", "payload": {"path": "/obj/missing"}},
+                    {"command": "node-info", "payload": {"path": "/obj/geo1/box1"}},
+                ],
+            },
+            hou_module=fake_hou,
+        )
+        self.assertFalse(partial["ok"])
+        self.assertTrue(partial["stopped"])
+        self.assertEqual(partial["count"], 2)
+        self.assertEqual(partial["error_count"], 1)
+
+        bundle = commands.execute("diagnostic-bundle", {"preset": "node_debug", "path": "/obj/geo1/OUT"}, hou_module=fake_hou)
+        self.assertEqual(bundle["preset"], "node_debug")
+        self.assertEqual(bundle["bundle"]["success_count"], 4)
+        self.assertEqual(bundle["steps"][0]["command"], "node_info")
+        self.assertEqual(bundle["bundle"]["results"][0]["result"]["path"], "/obj/geo1/OUT")
+        self.assertEqual(bundle["response_meta"]["command"], "diagnostic_bundle")
+
+        projected_bundle = commands.execute(
+            "diagnostic-bundle",
+            {"preset": "render_readiness", "root": "/out", "fields": ["preset", "bundle.success_count"]},
+            hou_module=fake_hou,
+        )
+        self.assertEqual(projected_bundle["preset"], "render_readiness")
+        self.assertEqual(projected_bundle["bundle"]["success_count"], 3)
+        self.assertTrue(projected_bundle["response_meta"]["projected"])
+
+    def test_scene_diff_compares_snapshot_payloads_without_houdini(self):
+        before = {
+            "network": {
+                "nodes": [
+                    {"path": "/obj/geo1/box1", "name": "box1", "type": "box", "category": "Sop"},
+                    {"path": "/obj/geo1/OUT", "name": "OUT", "type": "null", "category": "Sop"},
+                ],
+                "wires": [{"src": "/obj/geo1/box1", "dst": "/obj/geo1/OUT", "input_index": 0}],
+            }
+        }
+        after = {
+            "network": {
+                "nodes": [
+                    {"path": "/obj/geo1/box1", "name": "box1", "type": "box", "category": "Sop"},
+                    {"path": "/obj/geo1/color1", "name": "color1", "type": "color", "category": "Sop"},
+                    {"path": "/obj/geo1/OUT", "name": "OUT", "type": "null", "category": "Sop"},
+                ],
+                "wires": [
+                    {"src": "/obj/geo1/box1", "dst": "/obj/geo1/color1", "input_index": 0},
+                    {"src": "/obj/geo1/color1", "dst": "/obj/geo1/OUT", "input_index": 0},
+                ],
+            }
+        }
+        diff = commands.execute("scene-diff", {"before": before, "after": after, "max_changes": 10})
+        self.assertEqual(diff["summary"]["added_node_count"], 1)
+        self.assertEqual(diff["summary"]["removed_node_count"], 0)
+        self.assertEqual(diff["summary"]["added_wire_count"], 2)
+        self.assertEqual(diff["summary"]["removed_wire_count"], 1)
+        self.assertEqual(diff["nodes"]["added"][0]["path"], "/obj/geo1/color1")
 
     def test_edit_commands_require_edit_mode(self):
         fake_hou = FakeHou()
@@ -2096,11 +2687,16 @@ class BlibHouBridgeTests(unittest.TestCase):
         shelf_path = os.path.join(ROOT, "toolbar", "Blib_Houdini_Bridge.shelf")
         with open(shelf_path, "r", encoding="utf-8") as handle:
             source = handle.read()
-        self.assertIn('<toolshelf name="Blib_Houdini_Bridge"', source)
+        standalone = Path(ROOT) / "standalone" / "toolbar" / "Blib_Bridge_Standalone.shelf"
+        standalone_source = standalone.read_text(encoding="utf-8")
+        self.assertIn('<toolshelf name="Blib_Houdini_Bridge"', standalone_source)
         self.assertIn('<tool name="Blib_hou_bridge"', source)
-        self.assertIn('<tool name="Blib_hou_bridge_inspector"', source)
-        self.assertIn("shelf.toggle_server()", source)
         self.assertIn("shelf.show_inspector()", source)
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(source)
+        members = [item.get("name") for item in ET.fromstring(standalone_source).find("toolshelf").findall("memberTool")]
+        self.assertEqual(members, ["Blib_hou_bridge"])
+        self.assertEqual([item.get("name") for item in root.findall("tool")], ["Blib_hou_bridge"])
         self.assertNotIn("blib_agent", source)
 
     def test_shelf_reload_keeps_running_server_stoppable(self):
@@ -2115,7 +2711,7 @@ class BlibHouBridgeTests(unittest.TestCase):
         self.assertIn('"Reload"', source)
         with open(os.path.join(ROOT, "toolbar", "Blib_Houdini_Bridge.shelf"), encoding="utf-8") as handle:
             shelf_source = handle.read()
-        self.assertIn("shelf.set_edit_mode(True)", shelf_source)
+        self.assertIn("shelf.show_inspector()", shelf_source)
 
     def test_codex_setup_writes_bridge_mcp_config(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2185,15 +2781,20 @@ class BlibHouBridgeTests(unittest.TestCase):
     def test_shelf_start_registers_codex_mcp(self):
         calls = []
         original = shelf._ensure_codex_setup
-        try:
-            shelf._ensure_codex_setup = lambda: calls.append(True) or {
-                "ok": True,
-                "changed": True,
-                "message": "registered",
-            }
-            result = shelf.toggle_server()
-        finally:
-            shelf._ensure_codex_setup = original
+        with tempfile.TemporaryDirectory() as isolated_temp:
+            original_tempdir = tempfile.tempdir
+            try:
+                tempfile.tempdir = isolated_temp
+                shelf._ensure_codex_setup = lambda: calls.append(True) or {
+                    "ok": True,
+                    "changed": True,
+                    "message": "registered",
+                }
+                result = shelf.toggle_server()
+            finally:
+                server.stop_server()
+                tempfile.tempdir = original_tempdir
+                shelf._ensure_codex_setup = original
 
         self.assertTrue(result["running"])
         self.assertEqual(calls, [True])
@@ -3432,20 +4033,25 @@ class BlibHouBridgeTests(unittest.TestCase):
                 ["set_comment"],
             )
 
-    def test_edit_mode_command_toggles_gate_without_scene_edit(self):
-        self.assertFalse(state.edit_enabled())
-        result = commands.execute("edit-mode", {"enabled": True}, hou_module=FakeHou())
-        self.assertTrue(result["edit_enabled"])
+    def test_edit_mode_command_can_only_reduce_access(self):
+        from blib_hou_bridge.execution import TaskRejected
+        state.set_read_only(False)
         result = commands.execute("edit-mode", {"enabled": False}, hou_module=FakeHou())
         self.assertFalse(result["edit_enabled"])
+        self.assertFalse(result["python_enabled"])
+        with self.assertRaisesRegex(TaskRejected, "read-only"):
+            commands.execute("edit-mode", {"enabled": True}, hou_module=FakeHou())
 
-    def test_bridge_button_exposes_edit_mode_menu(self):
-        shelf_path = os.path.join(PYTHON_DIR, "blib_hou_bridge", "shelf.py")
-        with open(shelf_path, "r", encoding="utf-8") as handle:
-            source = handle.read()
-        self.assertIn('"Edit On"', source)
-        self.assertIn('"Edit Off"', source)
-        self.assertIn("state.set_edit_enabled(True)", source)
+    def test_local_edit_mode_switch_controls_python_with_edits(self):
+        try:
+            shelf._running_server_action(FakeShelfHou(choice=1), {})
+            self.assertEqual(state.access_snapshot()[:2], (True, True))
+            epoch = state.permission_epoch()
+            shelf._running_server_action(FakeShelfHou(choice=2), {})
+            self.assertEqual(state.access_snapshot()[:2], (False, False))
+            self.assertNotEqual(state.permission_epoch(), epoch)
+        finally:
+            state.set_read_only(True)
 
     def test_write_houdini_package_generates_receiver_local_root(self):
         tool = _load_tool_module("write_houdini_package")
@@ -3462,7 +4068,7 @@ class BlibHouBridgeTests(unittest.TestCase):
             tool.write_package(output, release_root)
 
             payload = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(payload["path"], "$BLIB_HOUDINI_BRIDGE")
+            self.assertEqual(payload["hpath"], ["$BLIB_HOUDINI_BRIDGE", "$BLIB_HOUDINI_BRIDGE/standalone"])
             self.assertEqual(payload["env"][0]["BLIB_HOUDINI_BRIDGE"], release_root.resolve().as_posix())
 
     def test_install_houdini_package_discovers_user_package_dir(self):

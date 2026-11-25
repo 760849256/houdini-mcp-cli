@@ -1,5 +1,9 @@
 # Blib Houdini Bridge
 
+The 0.3.0a3 candidate adds per-instance recovery, durable host tasks, guarded
+single-submission batches and compact MCP responses. See [task and recovery contracts](docs/TASKS.md).
+It remains a candidate until endurance and actual working-day observation gates pass.
+
 Blib Houdini Bridge lets Codex, MCP clients, CLI scripts, and similar local
 tools connect to Houdini and control a running scene in a safer, reviewable
 way.
@@ -14,10 +18,19 @@ This repository contains only the standalone bridge. It does not include the
 full Blib Tools production toolkit.
 
 When this `bridge/` folder is inside the full Blib Tools checkout, the main
-`Blib_tools.json` package loads the `Blib Bridge` shelf for you. In that case,
-open Houdini and click `Blib Bridge > Bridge`; the first launch starts the local
+`Blib_tools.json` package adds Bridge to the `Blib AI` shelf. In that case,
+open Houdini and click `Blib AI > Bridge`; the first launch starts the local
 server and registers the Codex MCP adapter in `%UserProfile%\.codex\config.toml`.
 Restart Codex or open a new Codex session after that first registration.
+Open **AI 接入** in the Bridge panel to check Codex registration or copy
+configuration for Codex, Antigravity, and other stdio MCP clients. See
+[client setup and adapter discovery](docs/HOUDINI_MCP.md#mcp-config).
+
+## Connection reliability candidate
+
+Version 0.3.0a1 adds per-instance discovery, operation binding, independent liveness,
+explicit instance selection through context, and local rotating diagnostics.
+See [connection recovery](docs/CONNECTION_RECOVERY.md) for activation, evidence and limits.
 
 ## Fast Path: Connect Codex To Houdini
 
@@ -79,8 +92,30 @@ If something gets stuck, jump to [Troubleshooting](#troubleshooting).
 
 ## What You Can Do With It
 
+The adapter defaults to six daily tools: context, inspect, edit, execute, look,
+and job. Use `--tool-profile advanced` for the full legacy tool list.
+For everyday work, start with `houdini_context`, use `houdini_edit` for a
+batch of ordinary edits with automatic structural readback, and inspect the
+result with `houdini_look`. `houdini_execute` runs custom Python in editable
+mode and waits for short jobs automatically. The older tools remain
+compatible. See [Everyday workflow](docs/HOUDINI_MCP.md#everyday-workflow) for
+examples, limits and activation instructions.
+
 - Let Codex or another MCP-capable assistant read the current Houdini scene.
 - Run simple CLI commands such as status checks and scene snapshots.
+- Capture read-only visual evidence from the Scene Viewer, visible panes, or a
+  Network Editor view of a node path.
+- Discover node types, inspect material/shader metadata, and compare before/after
+  scene snapshots without enabling edit mode.
+- Read safe SideFX documentation links, local help matches, and render settings
+  diagnostics without running scripts, fetching web pages, or starting renders.
+- Batch safe read-only diagnostics with `multi-read` to reduce client round
+  trips while keeping screenshots, plan tools, and edit commands out of the
+  batch surface.
+- Use `--fields` on common read commands or built-in diagnostic bundles to keep
+  responses small when only a few dot-path fields are needed.
+- Generate reviewable material creation or assignment plans as workflow templates
+  instead of exposing direct material write tools.
 - Keep Houdini-side edits gated behind explicit edit mode.
 - Review, validate, run, and verify controlled workflows instead of blindly
   executing changes.
@@ -124,14 +159,27 @@ python tools\write_houdini_package.py --output Blib_Houdini_Bridge.local.json
 1. Start Houdini.
 2. Open the `Blib Bridge` shelf.
 3. Click `Bridge` to start the local server.
-4. Keep edit mode off until you intentionally want a tool to write to the
-   scene.
+4. Bridge starts editable, including Python. Select **只读** in the panel
+   when the client should inspect and preview only.
 
 After the shelf server is running, check the connection:
 
 ```powershell
 python scripts\cli\blib_hou.py doctor
 python scripts\cli\blib_hou.py scene-snapshot --path /obj
+python scripts\cli\blib_hou.py scene-snapshot --path /obj --mode routing --fields summary semantics.scene_understanding
+python scripts\cli\blib_hou.py get-houdini-help box --help-type node --category Sop
+python scripts\cli\blib_hou.py list-node-types --category Sop --name cache
+python scripts\cli\blib_hou.py node-parms /obj/geo1/OUT --parm-names tx --fields node.path parms.name parms.value
+python scripts\cli\blib_hou.py parameter-schema /obj/geo1/OUT --name-contains file --no-menu --no-defaults
+python scripts\cli\blib_hou.py material-info --root /mat
+python scripts\cli\blib_hou.py render-info --root /out
+python scripts\cli\blib_hou.py multi-read .\read_steps.json
+python scripts\cli\blib_hou.py diagnostic-bundle node_debug --path /obj/geo1/OUT --fields preset bundle.success_count
+python scripts\cli\blib_hou.py node-info /obj/geo1/OUT --fields path flags.display messages
+python scripts\cli\blib_hou.py list-panes
+python scripts\cli\blib_hou.py capture-multiple-panes --types NetworkEditor SceneViewer Parm
+python scripts\cli\blib_hou.py network-screenshot --path /obj
 python scripts\cli\blib_hou_mcp.py --status
 ```
 
@@ -466,10 +514,22 @@ MCP 接口细节见 [docs/HOUDINI_MCP.md](docs/HOUDINI_MCP.md)。
 
 这个 bridge 的目标不是让外部工具随便改场景，而是让控制过程尽量可见、可审查：
 
-- 读取命令不需要开启 edit mode
-- 写入命令需要在 Houdini 侧明确开启 edit mode
+- Bridge 启动后默认可编辑，包含 Python 执行
+- 在 Houdini 面板勾选 **只读** 可暂停接收节点编辑和 Python 任务
 - 工作流命令支持 review、validate、run、verify
 - session token 只用于本地连接，不要贴到日志或提示词里
 
 发布检查、交付流程和更完整的验证说明见
 [docs/BRIDGE_ONLY_RELEASE.md](docs/BRIDGE_ONLY_RELEASE.md)。
+
+## Custom Python
+
+Call `houdini_execute` with your HOM `code`. An optional JSON `inputs` object is
+available as `bridge_inputs`. Assign a JSON value to `bridge_result` to return
+it as `result.data` alongside standard output. Use `houdini_job` with the
+returned UUID to retrieve longer tasks. Reuse the original UUID after a
+transport interruption.
+
+The **只读** control in Houdini blocks new scene writes and Python tasks.
+Python already running requires its normal completion or a cooperative
+checkpoint. See [task states and retention](docs/TASKS.md).

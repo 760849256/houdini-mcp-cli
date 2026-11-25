@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<shelfDocument>
+  <toolshelf name="Blib_Houdini_Bridge" label="Blib Bridge">
+    <memberTool name="Blib_hou_bridge"/>
+  </toolshelf>
+</shelfDocument>

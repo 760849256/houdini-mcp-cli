@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blib-houdini-bridge"
-version = "0.2.0"
+version = "0.3.0a3"
 description = "Safe local Houdini control bridge with CLI and MCP adapter."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -18,7 +18,7 @@ def package_payload(release_root: Path | str = ROOT) -> dict:
                 "BLIB_HOUDINI_BRIDGE": root.as_posix(),
             }
         ],
-        "path": "$BLIB_HOUDINI_BRIDGE",
+        "hpath": ["$BLIB_HOUDINI_BRIDGE", "$BLIB_HOUDINI_BRIDGE/standalone"],
     }
 
 

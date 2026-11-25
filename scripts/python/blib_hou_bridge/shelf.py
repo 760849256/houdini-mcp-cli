@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 
-from . import auth, codex_setup, commands, inspector, protocol, server, state
+from . import auth, codex_setup, commands, history, inspector, protocol, server, state
 
 
 def toggle_server() -> dict:
@@ -12,6 +12,7 @@ def toggle_server() -> dict:
     if not running:
         importlib.reload(protocol)
         importlib.reload(auth)
+        importlib.reload(history)
         importlib.reload(codex_setup)
         importlib.reload(state)
         importlib.reload(commands)
@@ -32,7 +33,7 @@ def toggle_server() -> dict:
         result["codex_setup"] = setup
         result["codex_message"] = _codex_message(setup)
         message = (
-            "Blib Houdini Bridge is running in read-only mode.\n"
+            "Blib Houdini Bridge is running in editable mode.\n"
             "Host: {host}\n"
             "Port: {port}\n"
             "Session: {session_path}\n\n"
@@ -45,7 +46,7 @@ def toggle_server() -> dict:
 
 
 def set_edit_mode(enabled: bool = True) -> bool:
-    state.set_edit_enabled(enabled)
+    state.set_read_only(not enabled)
     try:
         import hou  # type: ignore
     except ImportError:
@@ -56,18 +57,40 @@ def set_edit_mode(enabled: bool = True) -> bool:
     return state.edit_enabled()
 
 
+def set_python_mode(enabled: bool = True) -> bool:
+    """Compatibility entry point for older shelves."""
+    return set_edit_mode(enabled)
+
+
 def show_inspector():
+    setup = None
+    code_conflict = False
     if not server.status().get("running"):
         importlib.reload(protocol)
         importlib.reload(auth)
+        importlib.reload(history)
         importlib.reload(codex_setup)
         importlib.reload(state)
         importlib.reload(commands)
         importlib.reload(server)
-        server.start_server()
-        _ensure_codex_setup()
-    importlib.reload(inspector)
-    return inspector.show()
+        try:
+            server.start_server()
+        except ValueError as exc:
+            if str(exc) != "control_code_in_use":
+                raise
+            code_conflict = True
+        else:
+            setup = _ensure_codex_setup()
+    # Keep the existing window alive when the shelf button is clicked again.
+    window = getattr(inspector, "_window", None)
+    if window is None or not inspector._is_alive(window):
+        importlib.reload(inspector)
+    window = inspector.show()
+    if code_conflict:
+        window.set_setup_notice("此控制代码已被另一个 Houdini 使用。请保存新代码，再启动 Bridge。")
+    elif setup and (setup.get("changed") or not setup.get("ok")):
+        window.set_setup_notice(_codex_message(setup))
+    return window
 
 
 def _ensure_codex_setup() -> dict:
@@ -109,19 +132,24 @@ def _running_server_action(hou, status: dict) -> dict:
         close_choice=0,
     )
     if choice == 1:
-        state.set_edit_enabled(True)
+        state.set_read_only(False)
         return {"running": True, "edit_enabled": True, "message": "Blib Houdini Bridge edit mode: ON"}
     if choice == 2:
-        state.set_edit_enabled(False)
+        state.set_read_only(True)
         return {"running": True, "edit_enabled": False, "message": "Blib Houdini Bridge edit mode: OFF"}
     if choice == 3:
-        server.stop_server()
+        read_only = not state.edit_enabled()
+        try:
+            server.stop_server()
+        except Exception as exc:
+            return {"running": True, "message": str(exc)}
         importlib.reload(protocol)
         importlib.reload(auth)
+        importlib.reload(history)
         importlib.reload(state)
         importlib.reload(commands)
         importlib.reload(server)
-        result = server.start_server()
+        result = server.start_server(read_only=read_only)
         return {
             "running": True,
             "edit_enabled": state.edit_enabled(),

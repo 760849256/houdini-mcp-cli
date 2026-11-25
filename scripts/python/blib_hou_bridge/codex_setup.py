@@ -1,8 +1,12 @@
-"""Codex MCP registration helpers for the Houdini shelf entrypoint."""
+"""Local MCP client configuration and Codex registration."""
 
 from __future__ import annotations
 
+import ast
+import hashlib
+import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -10,6 +14,54 @@ from pathlib import Path
 
 SERVER_NAME = "blib-houdini-bridge"
 CONFIG_HEADER = "[mcp_servers.%s]" % SERVER_NAME
+MCP_CLIENTS = {"codex": "Codex", "antigravity": "Antigravity", "generic": "通用 MCP"}
+
+
+def client_launch_args() -> list[str]:
+    script = _default_mcp_script_path()
+    if Path(script).is_file():
+        return [script]
+    return ["-m", "blib_hou_mcp"]
+
+
+def instance_server_name(instance: str | None, hip_name: str = "", pid: int | None = None) -> str:
+    if not instance:
+        return SERVER_NAME
+    identity = hashlib.sha256(instance.encode("utf-8")).hexdigest()[:8]
+    stem = Path(hip_name).stem.casefold() if hip_name else ""
+    label = re.sub(r"[^a-z0-9]+", "-", stem).strip("-")[:30].rstrip("-")
+    suffix = f"{pid}-{identity}" if type(pid) is int else identity
+    return f"blib-houdini-{label}-{suffix}" if label else f"{SERVER_NAME}-{suffix}"
+
+
+def validate_server_name(name: str) -> str:
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name):
+        raise ValueError("MCP name must start with an ASCII letter and contain up to 64 letters, digits, hyphens or underscores.")
+    return name
+
+
+def render_client_config(client: str, command: str, args: list[str], server_name: str = SERVER_NAME) -> str:
+    server_name = validate_server_name(server_name)
+    if client == "codex":
+        lines = [f"[mcp_servers.{server_name}]", "command = %s" % json.dumps(command, ensure_ascii=False), "args = ["]
+        lines.extend("  %s," % json.dumps(arg, ensure_ascii=False) for arg in args)
+        return "\n".join([*lines, "]"])
+    if client in ("antigravity", "generic"):
+        return json.dumps({"mcpServers": {server_name: {"command": command, "args": args}}}, indent=2)
+    raise ValueError("Unknown MCP client: %s" % client)
+
+
+def client_command(instance: str | None = None) -> tuple[str, list[str]]:
+    program = _normalize_command(_default_python_executable())
+    arguments = client_launch_args()
+    if instance:
+        arguments.extend(["--instance", instance])
+    return program, arguments
+
+
+def client_config_preview(client: str, instance: str | None = None, server_name: str | None = None) -> str:
+    name = instance_server_name(instance) if server_name is None else server_name
+    return render_client_config(client, *client_command(instance), server_name=name)
 
 
 def ensure_codex_mcp_registered(
@@ -21,11 +73,12 @@ def ensure_codex_mcp_registered(
     config = Path(config_path).expanduser() if config_path is not None else _default_codex_config_path()
     command = _normalize_command(python_executable or _default_python_executable())
     script = str(Path(script_path).resolve()) if script_path is not None else _default_mcp_script_path()
-    block = _codex_config_block(command, script)
+    args = [script] if script_path is not None else client_launch_args()
+    block = render_client_config("codex", command, args)
 
     existing = config.read_text(encoding="utf-8") if config.exists() else ""
     current = _extract_server_block(existing)
-    if current == block:
+    if current == block or _configured_entrypoint_matches(current, args):
         return {
             "ok": True,
             "changed": False,
@@ -113,8 +166,8 @@ def _python_executable_candidates() -> list[Path]:
 
     hfs = os.environ.get("HFS")
     if hfs:
-        candidates.append(Path(hfs) / "bin" / "hython.exe")
         candidates.extend(sorted(Path(hfs).glob("python*/python.exe"), reverse=True))
+        candidates.append(Path(hfs) / "bin" / "hython.exe")
 
     current = Path(sys.executable)
     if _looks_like_python_executable(current):
@@ -129,20 +182,20 @@ def _looks_like_python_executable(path: Path) -> bool:
     return name in {"python.exe", "python3.exe", "hython.exe", "python", "python3", "hython"} or name.startswith("python")
 
 
-def _codex_config_block(command: str, script: str) -> str:
-    return "\n".join(
-        [
-            CONFIG_HEADER,
-            "command = %s" % _toml_string(command),
-            "args = [",
-            "  %s," % _toml_string(script),
-            "]",
-        ]
-    )
-
-
-def _toml_string(value: str) -> str:
-    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+def _configured_entrypoint_matches(block: str, args: list[str]) -> bool:
+    """Keep custom instance, session and profile options for this entry point."""
+    match = re.search(r"(?ms)^args\s*=\s*(\[.*?\])", block)
+    if not match:
+        return False
+    try:
+        arguments = ast.literal_eval(match.group(1))
+        if not isinstance(arguments, list) or not arguments or not isinstance(arguments[0], str):
+            return False
+        if args[0] == "-m":
+            return arguments[:2] == args
+        return os.path.normcase(os.path.abspath(arguments[0])) == os.path.normcase(os.path.abspath(args[0]))
+    except (ValueError, SyntaxError):
+        return False
 
 
 def _extract_server_block(text: str) -> str:

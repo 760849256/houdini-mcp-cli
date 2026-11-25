@@ -17,8 +17,15 @@ REQUIRED_PATHS = [
     "LICENSE",
     "README.md",
     "toolbar/Blib_Houdini_Bridge.shelf",
+    "standalone/toolbar/Blib_Bridge_Standalone.shelf",
+    "icons/bridge.svg",
     "scripts/python/blib_hou_bridge/__init__.py",
     "scripts/python/blib_hou_bridge/auth.py",
+    "scripts/python/blib_hou_bridge/connection.py",
+    "scripts/python/blib_hou_bridge/execution.py",
+    "scripts/python/blib_hou_bridge/tasks.py",
+    "scripts/python/blib_hou_bridge/targets.py",
+    "scripts/python/blib_hou_bridge/workflows.py",
     "scripts/python/blib_hou_bridge/codex_setup.py",
     "scripts/python/blib_hou_bridge/commands.py",
     "scripts/python/blib_hou_bridge/protocol.py",
@@ -26,19 +33,34 @@ REQUIRED_PATHS = [
     "scripts/python/blib_hou_bridge/shelf.py",
     "scripts/python/blib_hou_mcp/__init__.py",
     "scripts/python/blib_hou_mcp/server.py",
+    "scripts/python/blib_hou_mcp/__main__.py",
+    "scripts/python/blib_hou_mcp/quick_tools.py",
+    "scripts/python/blib_hou_mcp/requests.py",
+    "scripts/python/blib_hou_mcp/responses.py",
     "scripts/python/blib_hou.py",
     "scripts/cli/blib_hou.py",
     "scripts/cli/blib_hou_mcp.py",
     "docs/HOUDINI_MCP.md",
     "docs/BRIDGE_ONLY_RELEASE.md",
     "docs/COMPATIBILITY.md",
+    "docs/CONNECTION_RECOVERY.md",
+    "docs/TASKS.md",
     "SECURITY.md",
     "pyproject.toml",
     "tools/acceptance_smoke.py",
+    "tools/acceptance_connection.py",
+    "tools/acceptance_tasks.py",
+    "tools/acceptance_faults.py",
+    "tools/benchmark_workflows.py",
+    "tools/soak_bridge.py",
     "tools/clean_release_artifacts.py",
     "tools/install_houdini_package.py",
     "tools/write_houdini_package.py",
     "tests/test_blib_hou_bridge.py",
+    "tests/test_connection_recovery.py",
+    "tests/test_task_lifecycle.py",
+    "tests/test_task_transport.py",
+    "tests/test_workflow_performance.py",
     "tests/test_blib_hou_mcp.py",
 ]
 
@@ -150,8 +172,8 @@ def validate_release(public: bool = False) -> tuple[int, int, list[tuple[str, st
                             % (bridge_root, ROOT),
                         )
                     )
-            if package.get("path") != "$BLIB_HOUDINI_BRIDGE":
-                findings.append(("WARN", 'Blib_Houdini_Bridge.json path should be "$BLIB_HOUDINI_BRIDGE".'))
+            if package.get("hpath") != ["$BLIB_HOUDINI_BRIDGE", "$BLIB_HOUDINI_BRIDGE/standalone"]:
+                findings.append(("WARN", "Bridge-only package must include the bridge and standalone shelf paths."))
 
     pyproject = ROOT / "pyproject.toml"
     if pyproject.exists():
@@ -180,7 +202,7 @@ def validate_release(public: bool = False) -> tuple[int, int, list[tuple[str, st
         for needle in FORBIDDEN_SHELF_IMPORTS:
             if needle in shelf_text:
                 findings.append(("ERROR", "Bridge shelf must not depend on main Blib Tools surface: %s" % needle))
-        for needle in ("blib_hou_bridge", "shelf.toggle_server", "shelf.show_inspector"):
+        for needle in ("blib_hou_bridge", "shelf.show_inspector"):
             if needle not in shelf_text:
                 findings.append(("ERROR", "Bridge shelf missing expected standalone entrypoint: %s" % needle))
 

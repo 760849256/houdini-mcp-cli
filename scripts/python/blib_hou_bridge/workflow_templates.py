@@ -17,6 +17,8 @@ TEMPLATE_NAMES = (
     "vellum-grains-preview",
     "vellum-cloth-preview",
     "pyro-source-preview",
+    "material-create-preview",
+    "material-assign-preview",
 )
 
 TEMPLATE_REQUIRED_FLOW = ["houdini_review_plan", "houdini_validate_plan", "houdini_run_plan", "houdini_verify_plan"]
@@ -37,6 +39,7 @@ TEMPLATE_CATEGORY_RISK_DOMAINS = {
     "cleanup": ["geometry_topology"],
     "cache": ["cache_output", "file_path", "cook_cost"],
     "render": ["render_settings", "file_path", "camera_material_review"],
+    "material": ["material_assignment", "camera_material_review"],
     "volume": ["volume_resolution", "cook_cost"],
     "dynamics": ["simulation_settings", "cook_cost", "cache_strategy"],
 }
@@ -59,6 +62,12 @@ TEMPLATE_CATEGORY_VERIFICATION_FOCUS = {
         "success_criteria": ["lop_network_exists", "sop_import_points_to_input", "render_settings_match_options", "render_rop_prepared", "no_render_execution_claimed"],
         "evidence_artifacts": ["verification", "snapshot_after", "summary"],
         "notes": ["Template prepares Karma/Solaris settings only; rendered images require a separate reviewed render workflow."],
+    },
+    "material": {
+        "read_tools": ["houdini_verify_plan", "houdini_material_info", "houdini_node_parms", "houdini_network"],
+        "success_criteria": ["material_node_exists", "material_parameters_match_plan", "assignment_node_points_to_material", "no_render_execution_claimed"],
+        "evidence_artifacts": ["verification", "snapshot_after", "summary"],
+        "notes": ["Templates prepare material creation or assignment plans only; review material paths and shader parameters before execution."],
     },
     "volume": {
         "read_tools": ["houdini_verify_plan", "houdini_node_info", "houdini_node_parms", "houdini_viewport_screenshot"],
@@ -122,6 +131,18 @@ TEMPLATE_CATALOG = {
         "description": "Build a Pyro source/rasterize/solver preview workflow.",
         "presets": ["preview", "production"],
         "optional_flags": ["no_solver", "cache", "cache_path", "voxel_size", "substeps", "start_frame", "dissipation"],
+    },
+    "material-create-preview": {
+        "category": "material",
+        "description": "Create a reviewable material/shader setup under /mat without assigning or rendering it.",
+        "presets": ["preview"],
+        "optional_flags": ["material_name", "material_type", "base_color", "roughness", "texture_path"],
+    },
+    "material-assign-preview": {
+        "category": "material",
+        "description": "Insert a SOP material assignment node after the input stream and point it at an existing or planned material.",
+        "presets": ["preview"],
+        "optional_flags": ["material_path", "assign_name", "group", "output_name"],
     },
 }
 
@@ -219,6 +240,10 @@ def build_plan(template: str, input_path: str, options: dict[str, Any] | None = 
         return _vellum_cloth(input_path, options, preset)
     if template == "pyro-source-preview":
         return _pyro_source(input_path, options, preset)
+    if template == "material-create-preview":
+        return _material_create(input_path, options)
+    if template == "material-assign-preview":
+        return _material_assign(input_path, options)
     raise ValueError("Unknown workflow template: %s" % template)
 
 
@@ -442,6 +467,46 @@ def _pyro_source(input_path: str, options: dict[str, Any], preset: str) -> list[
     out = chain.output(options.get("output_name") or "OUT_PYRO", [0.95, 0.45, 0.15], "Bridge Pyro preview output.")
     created.append(out)
     chain.finish(_box_name(base), created, "Pyro source preview template.")
+    return chain.steps
+
+
+def _material_create(input_path: str, options: dict[str, Any]) -> list[dict[str, Any]]:
+    base = _base_name(options, "MAT")
+    material_name = _safe_name(options.get("material_name") or "%s_MATERIAL" % base, "MAT_MATERIAL")
+    material_type = _safe_name(options.get("material_type") or "principledshader", "principledshader").lower()
+    material_path = "/mat/%s" % material_name
+    steps: list[dict[str, Any]] = [
+        {"command": "create-node", "payload": {"parent": "/mat", "type": material_type, "name": material_name}},
+        {"command": "set-comment", "payload": {"node": material_path, "comment": "Bridge material preview for %s. Review shader parameters before assigning or rendering." % input_path}},
+    ]
+    if "base_color" in options:
+        color = options.get("base_color")
+        steps.append({"command": "set-parm-any", "payload": {"node": material_path, "parms": ["basecolor", "base_color", "diffuse_color", "basecolor1"], "value": color, "required": False}})
+    if "roughness" in options:
+        steps.append({"command": "set-parm-any", "payload": {"node": material_path, "parms": ["rough", "roughness", "refl_rough"], "value": options.get("roughness"), "required": False}})
+    if options.get("texture_path"):
+        steps.append({"command": "set-parm-any", "payload": {"node": material_path, "parms": ["basecolor_texture", "basecolor_map", "diffuse_texture", "map_basecolor"], "value": options.get("texture_path"), "required": False}})
+    steps.extend(
+        [
+            {"command": "create-sticky-note", "payload": {"parent": "/mat", "name": "NOTE_%s_MATERIAL" % base, "text": "Material preview template. This plan creates/configures a material only; assignment and render proof are separate reviewed steps."}},
+            {"command": "layout", "payload": {"path": "/mat"}},
+            {"command": "select", "payload": {"path": material_path}},
+        ]
+    )
+    return steps
+
+
+def _material_assign(input_path: str, options: dict[str, Any]) -> list[dict[str, Any]]:
+    base = _base_name(options, "MAT")
+    material_path = str(options.get("material_path") or "/mat/%s_MATERIAL" % base)
+    assign_name = _safe_name(options.get("assign_name") or _node_name(base, "ASSIGN_MATERIAL"), "MAT_ASSIGN")
+    chain = _Chain(input_path)
+    assign = chain.append("material", assign_name)
+    if options.get("group"):
+        chain.set_parm_any(assign, ["group", "group1"], options.get("group"), required=False)
+    chain.set_parm_any(assign, ["shop_materialpath1", "shop_materialpath", "materialpath", "material"], material_path, required=False)
+    out = chain.output(options.get("output_name") or "OUT_MATERIAL", [0.7, 0.45, 0.2], "Bridge material assignment output.")
+    chain.finish(_box_name(base), [assign, out], "Material assignment preview template. Review the material path before rendering.")
     return chain.steps
 
 

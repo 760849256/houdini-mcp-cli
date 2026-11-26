@@ -33,11 +33,12 @@ def scoped(method):
 
 
 class Connection:
-    def __init__(self, session_path=None, instance=None, session_loader=None, poster=None, *, control_code=None):
+    def __init__(self, session_path=None, instance=None, session_loader=None, poster=None, *, control_code=None, port=None):
         self.session_path = session_path
         self.bound_instance = instance
         self._pinned_instance = instance
         self.control_code = control_code
+        self.port = port
         self._loader = session_loader
         self._poster = poster
         self._custom = session_loader is not None or poster is not None
@@ -107,12 +108,33 @@ class Connection:
             raise ConnectionError("control_code_offline", "This control code has no live Houdini. Check it in the Bridge control center.")
         if len(matches) > 1:
             raise ConnectionError("control_code_ambiguous", "Several Houdinis use this control code. Give them distinct codes.")
-        instance = auth.session_key(matches[0])
+        return code, self._confirm_route(matches[0], target_instance, "control_code")
+
+    def match_port(self, port, target_instance=None):
+        try:
+            port = auth.normalize_port(port)
+        except ValueError as exc:
+            raise ConnectionError("invalid_port", str(exc)) from exc
+        matches = [record for record in auth.discover_sessions(self.session_path)
+                   if record["port"] == port and record["availability"] == "available"]
+        if not matches:
+            raise ConnectionError("port_offline", "No live Houdini Bridge is registered at this port.")
+        if len(matches) > 1:
+            raise ConnectionError("port_ambiguous", "Several Bridge records claim this port. Verify the intended Houdini.")
+        return port, self._confirm_route(matches[0], target_instance, "port")
+
+    def _confirm_route(self, session, target_instance, route):
+        instance = auth.session_key(session)
         if self._pinned_instance is not None and self._pinned_instance != instance:
             raise ConnectionError("instance_locked", "This MCP connection is pinned to a different Houdini instance.")
         if target_instance is not None and target_instance != instance:
-            raise ConnectionError("control_code_changed", "The control code now points to a different Houdini. Confirm the intended HIP with houdini_context.")
-        return code, instance
+            raise ConnectionError(f"{route}_changed", "The route now points to a different Houdini. Confirm the intended HIP with houdini_context.")
+        return instance
+
+    def _matches_route(self, session):
+        return (auth.session_key(session) == self.bound_instance
+                and (self.control_code is None or session.get("control_code") == self.control_code)
+                and (self.port is None or session["port"] == self.port))
 
     def _resolve(self):
         pinned = getattr(self._local, "session", None)
@@ -124,17 +146,17 @@ class Connection:
                 raise ConnectionError("offline", "No active Blib Houdini Bridge session was found. Start the Bridge shelf tool.")
         else:
             candidates = auth.discover_sessions(self.session_path)
-            live = [s for s in candidates if s["availability"] == "available"]
+            live = [s for s in candidates if s["availability"] == "available"
+                    and (self.port is None or s["port"] == self.port)]
             if self.bound_instance:
-                matches = [s for s in live if auth.session_key(s) == self.bound_instance
-                           and (self.control_code is None or s.get("control_code") == self.control_code)]
+                matches = [s for s in live if self._matches_route(s)]
                 if not matches:
                     known = next((s for s in candidates if auth.session_key(s) == self.bound_instance), None)
                     raise ConnectionError("instance_offline", "The bound Houdini instance is unavailable; no other instance was selected.",
                                           [auth.public_session(s) for s in ([known] if known else candidates)])
                 session = matches[0]
             elif len(live) > 1:
-                raise ConnectionError("instance_required", "Several Houdini Bridges are available. Ask for the control code shown in the intended window, then call houdini_context with control_code.",
+                raise ConnectionError("instance_required", "Several Houdini Bridges are available. Ask for the port shown in the intended window, then call houdini_context with port.",
                                       [auth.public_session(s) for s in live])
             elif not live:
                 raise ConnectionError("offline", "No live registered Houdini Bridge was found. Start Bridge in the intended Houdini.",
@@ -301,8 +323,7 @@ class Connection:
 
     def _fresh_bound(self):
         return next((s for s in auth.discover_sessions(self.session_path)
-                     if s["availability"] == "available" and auth.session_key(s) == self.bound_instance
-                     and (self.control_code is None or s.get("control_code") == self.control_code)), None)
+                     if s["availability"] == "available" and self._matches_route(s)), None)
 
     @property
     def request_control(self):

@@ -40,8 +40,8 @@ ADAPTER_INSTRUCTIONS = (
     "to confirm the active instance, scene, selection, and permissions. Scene changes require "
     "Houdini editable mode, which includes custom Python. Read houdini://adapter/about "
     "for tool discovery and houdini://connection/current for connection status. "
-    "When the user provides a Bridge control code, call houdini_context with control_code "
-    "and confirm the HIP. Pass the same control_code and the returned session_id as target_instance "
+    "When the user provides a local Bridge endpoint, call houdini_context with its numeric port "
+    "and confirm the HIP. Pass the same port and the returned session_id as target_instance "
     "on every subsequent Houdini tool call. On a mismatch, stop and ask which HIP is intended."
 )
 
@@ -122,8 +122,8 @@ class BridgeMCPAdapter:
         self._poster = poster or self._post_to_bridge
         self._default_connection = Connection(session_path, instance, session_loader, poster)
         self._tool_route = threading.local()
-        self._code_connections = {}
-        self._code_lock = threading.Lock()
+        self._routed_connections = {}
+        self._route_lock = threading.Lock()
 
     @property
     def _connection(self):
@@ -316,15 +316,18 @@ class BridgeMCPAdapter:
         context_tool = next(tool for tool in tools if tool["name"] == "houdini_context")
         context_tool["inputSchema"].setdefault("properties", {})["instance"] = {
             "type": "string", "description": "Select a registered instance on an automatic connection, or omit to keep the current target. A launch configuration with --instance is fixed."}
-        context_tool["description"] += " Use control_code from the Bridge control center to match a Houdini and return its HIP and session_id."
+        context_tool["description"] += " Use the numeric port shown in Bridge to select a Houdini and return its HIP and session_id."
         combined = quick_tools.tool_definitions() + tools
         for tool in combined:
             if tool["name"] not in LOCAL_TOOL_NAMES:
                 properties = tool["inputSchema"].setdefault("properties", {})
+                properties["port"] = {
+                    "type": "integer", "minimum": 1, "maximum": 65535,
+                    "description": "Number after 127.0.0.1: in the intended Houdini's Bridge window."}
                 properties["control_code"] = {
-                    "type": "string", "description": "Control code shown in the intended Houdini's Bridge control center."}
+                    "type": "string", "description": "Optional route for older clients that already have a control code."}
                 properties["target_instance"] = {
-                    "type": "string", "description": "The session_id from houdini_context for this code. Required on subsequent code-routed calls."}
+                    "type": "string", "description": "The session_id from houdini_context. Required on subsequent explicitly routed calls."}
         if (profile or self.tool_profile) == "daily":
             names = ["houdini_context", "houdini_inspect", "houdini_edit", "houdini_execute", "houdini_look", "houdini_job"]
             by_name = {tool["name"]: tool for tool in combined}
@@ -332,31 +335,33 @@ class BridgeMCPAdapter:
         return combined
 
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(arguments, dict) or not ({"control_code", "target_instance"} & arguments.keys()):
+        if not isinstance(arguments, dict) or not ({"port", "control_code", "target_instance"} & arguments.keys()):
             return self._call_tool(tool_name, arguments)
         arguments = dict(arguments)
-        code = arguments.pop("control_code", None)
+        route = "port" if "port" in arguments else "control_code"
+        value = arguments.pop(route, None)
         target = arguments.pop("target_instance", None)
         try:
-            if tool_name in LOCAL_TOOL_NAMES or "instance" in arguments:
-                raise ConnectionError("bad_request", "Use control_code only with a Houdini tool, without the instance argument.")
+            if tool_name in LOCAL_TOOL_NAMES or "instance" in arguments or "control_code" in arguments:
+                raise ConnectionError("bad_request", "Use a single port or control_code with a Houdini tool, without instance.")
             if not isinstance(target, str) or not target:
                 if target is not None or tool_name != "houdini_context":
-                    raise ConnectionError("target_instance_required", "First call houdini_context with the control code and pass its session_id as target_instance.")
+                    raise ConnectionError("target_instance_required", "First call houdini_context with the same route and pass its session_id as target_instance.")
             base = self._default_connection
-            code, instance = base.match_control_code(code, target)
+            matcher = base.match_port if route == "port" else base.match_control_code
+            value, instance = matcher(value, target)
             if "session_id" in arguments and arguments["session_id"] != instance:
                 raise ConnectionError("instance_mismatch", "The job belongs to a different Houdini instance.")
         except ConnectionError as exc:
             return _tool_result(failure(exc.code, str(exc), executed=False), is_error=True)
-        key = (code, instance)
-        with self._code_lock:
-            connection = self._code_connections.get(key)
+        key = (route, value, instance)
+        with self._route_lock:
+            connection = self._routed_connections.get(key)
             if connection is None:
-                connection = Connection(base.session_path, instance, control_code=code)
-                if len(self._code_connections) >= 32:
-                    self._code_connections.pop(next(iter(self._code_connections)))
-                self._code_connections[key] = connection
+                connection = Connection(base.session_path, instance, **{route: value})
+                if len(self._routed_connections) >= 32:
+                    self._routed_connections.pop(next(iter(self._routed_connections)))
+                self._routed_connections[key] = connection
         self._tool_route.connection = connection
         try:
             with connection.request_scope(base.request_control):

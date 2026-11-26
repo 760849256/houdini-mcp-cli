@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import time
 from pathlib import Path
@@ -11,9 +12,23 @@ from . import auth, codex_setup, commands, history, protocol, server, state
 
 try:
     from blib_core.qt import QtCore, QtGui, QtWidgets, main_window
-    from blib_core.ui_theme import apply_blib_theme
+    from blib_core.ui_palette import PALETTE
+    from blib_core.ui_theme import apply_blib_theme, make_button, make_panel
 except Exception:  # noqa: BLE001 - standalone Bridge does not include blib_core.
     apply_blib_theme = None
+    PALETTE = {"panel": "#303030", "line": "#484848", "text": "#e4e4e4", "text_muted": "#a3a3a3",
+               "success": "#82aa86", "warning": "#c6a46d"}
+
+    def make_button(text, role="action"):
+        return QtWidgets.QPushButton(text)
+
+    def make_panel():
+        panel = QtWidgets.QFrame()
+        panel.setObjectName("Panel")
+        panel.setStyleSheet("QFrame#Panel { background: %s; border: 1px solid %s; border-radius: 6px; }"
+                            % (PALETTE["panel"], PALETTE["line"]))
+        return panel
+
     try:
         from PySide6 import QtCore, QtGui, QtWidgets
     except ImportError:
@@ -75,6 +90,8 @@ def show() -> Any:
     if _window is None or not _is_alive(_window):
         parent = main_window() if main_window is not None else None
         _window = BridgeInspectorDialog(parent)
+    elif not _window.isVisible():
+        _window.more_button.setChecked(False)
     _window.refresh()
     _window.show()
     _window.raise_()
@@ -84,70 +101,119 @@ def show() -> Any:
 
 if QtWidgets is not None:
 
+    def _copy_icon():
+        pixmap = QtGui.QPixmap(32, 32)
+        pixmap.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(pixmap)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.scale(2, 2)
+        painter.setPen(QtGui.QPen(QtGui.QColor(PALETTE["text"]), 1.25))
+        back = QtGui.QPainterPath()
+        back.moveTo(3.5, 11)
+        back.lineTo(2, 11)
+        back.lineTo(2, 2)
+        back.lineTo(10, 2)
+        back.lineTo(10, 3.5)
+        painter.drawPath(back)
+        painter.drawRoundedRect(QtCore.QRectF(5.5, 5.5, 8.5, 8.5), 1.25, 1.25)
+        painter.end()
+        pixmap.setDevicePixelRatio(2)
+        return QtGui.QIcon(pixmap)
+
+
     class BridgeInspectorDialog(QtWidgets.QDialog):
         def __init__(self, parent=None):
             super().__init__(parent)
-            self.setWindowTitle("Blib Bridge 控制中心")
-            self.resize(570, 255)
+            self.setWindowTitle("Blib Bridge")
             if apply_blib_theme is not None:
                 apply_blib_theme(self, "QDialog")
             self._build_ui()
+            self._update_expansion()
             self.refresh()
 
         def _build_ui(self) -> None:
             layout = QtWidgets.QVBoxLayout(self)
-            layout.setContentsMargins(22, 20, 22, 18)
-            layout.setSpacing(12)
+            layout.setContentsMargins(16, 12, 16, 12)
+            layout.setSpacing(10)
 
+            header = QtWidgets.QHBoxLayout()
             title = QtWidgets.QLabel("Blib Bridge")
-            title.setStyleSheet("font-size: 20px; font-weight: 600;")
-            title.setFixedHeight(28)
-            layout.addWidget(title)
+            title_font = title.font()
+            title_font.setBold(True)
+            title.setFont(title_font)
+            header.addWidget(title)
+            header.addStretch(1)
+            self.more_button = make_button("更多")
+            self.more_button.setAutoDefault(False)
+            self.more_button.setCheckable(True)
+            self.more_button.setToolTip("查看 AI 接入、预览和诊断")
+            header.addWidget(self.more_button)
+            layout.addLayout(header)
+
+            connection = make_panel()
+            connection_layout = QtWidgets.QVBoxLayout(connection)
+            connection_layout.setContentsMargins(12, 10, 12, 10)
+            connection_layout.setSpacing(8)
+            status_row = QtWidgets.QHBoxLayout()
+            self.server_mark = QtWidgets.QLabel()
+            self.server_mark.setAlignment(QtCore.Qt.AlignCenter)
+            self.server_mark.setFixedWidth(16)
+            status_row.addWidget(self.server_mark)
+            self.server_state = QtWidgets.QLabel()
+            self.server_state.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            status_row.addWidget(self.server_state)
+            self.port_edit = QtWidgets.QLineEdit()
+            self.port_edit.setAccessibleName("端口")
+            self.port_edit.setFixedWidth(72)
+            self.port_edit.setMaxLength(5)
+            self.port_edit.setValidator(QtGui.QIntValidator(1, 65535, self.port_edit))
+            self.port_edit.setPlaceholderText("自动")
+            self.port_edit.setToolTip("输入 1–65535 的端口，回车或点击「应用端口」生效。")
+            self.port_edit.returnPressed.connect(self._apply_port)
+            self.port_edit.textEdited.connect(self._port_edited)
+            status_row.addWidget(self.port_edit)
+            self.copy_connection_button = make_button("")
+            self.copy_connection_button.setAutoDefault(False)
+            self.copy_connection_button.setAccessibleName("复制给 AI")
+            self.copy_connection_button.setToolTip("复制连接信息给 AI")
+            self.copy_connection_button.setIcon(_copy_icon())
+            self.copy_connection_button.setIconSize(QtCore.QSize(16, 16))
+            self.copy_connection_button.setFixedSize(28, 28)
+            self.copy_connection_button.setStyleSheet("padding: 0; min-height: 0;")
+            self.copy_connection_button.clicked.connect(self._copy_connection)
+            status_row.addWidget(self.copy_connection_button)
+            status_row.addStretch(1)
+            self.read_only = QtWidgets.QCheckBox("只读")
+            status_row.addWidget(self.read_only)
+            connection_layout.addLayout(status_row)
+            self.server_button = make_button("")
+            self.server_button.setAutoDefault(False)
+            connection_layout.addWidget(self.server_button)
+            self.connection_notice = QtWidgets.QLabel()
+            self.connection_notice.setWordWrap(True)
+            self.connection_notice.setTextFormat(QtCore.Qt.PlainText)
+            self.connection_notice.setStyleSheet("color: %s;" % PALETTE["warning"])
+            self.connection_notice.hide()
+            connection_layout.addWidget(self.connection_notice)
+            layout.addWidget(connection)
+
+            self.more_content = QtWidgets.QWidget()
+            more_layout = QtWidgets.QVBoxLayout(self.more_content)
+            more_layout.setContentsMargins(0, 0, 0, 0)
+            more_layout.setSpacing(10)
+            layout.addWidget(self.more_content, 1)
+
             self.status_label = QtWidgets.QLabel("")
             self.status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            self.status_label.setStyleSheet("color: #a3a3a3;")
+            self.status_label.setStyleSheet("color: %s;" % PALETTE["text_muted"])
             self.status_label.setFixedHeight(20)
-            layout.addWidget(self.status_label)
-
-            panel = QtWidgets.QFrame()
-            panel.setStyleSheet("QFrame#bridgePanel { background: #303030; border: 1px solid #484848; border-radius: 8px; }")
-            panel.setObjectName("bridgePanel")
-            rows = QtWidgets.QVBoxLayout(panel)
-            rows.setContentsMargins(16, 10, 16, 10)
-            rows.setSpacing(4)
-            controls = QtWidgets.QHBoxLayout()
-            self.server_state = QtWidgets.QLabel()
-            controls.addWidget(self.server_state)
-            controls.addStretch(1)
-            self.server_button = QtWidgets.QPushButton()
-            controls.addWidget(self.server_button)
-            self.read_only = QtWidgets.QCheckBox("只读")
-            self.read_only.setToolTip("只读时，场景修改和 Python 执行都会暂停接收。")
-            controls.addWidget(self.read_only)
-            rows.addLayout(controls)
-            code_row = QtWidgets.QHBoxLayout()
-            code_row.addWidget(QtWidgets.QLabel("控制代码"))
-            self.control_code = QtWidgets.QLineEdit()
-            self.control_code.setAccessibleName("控制代码")
-            self.control_code.setMaxLength(32)
-            self.control_code.setToolTip("每个 Houdini 生成独立代码。可改成 3–32 位字母、数字、下划线或短横线，以字母或数字开头。")
-            code_row.addWidget(self.control_code, 1)
-            self.save_code_button = QtWidgets.QPushButton("保存")
-            self.save_code_button.clicked.connect(self._save_control_code)
-            self.control_code.returnPressed.connect(self._save_control_code)
-            code_row.addWidget(self.save_code_button)
-            self.copy_code_button = QtWidgets.QPushButton("复制给 AI")
-            self.copy_code_button.clicked.connect(self._copy_control_code)
-            code_row.addWidget(self.copy_code_button)
-            self.control_code.textEdited.connect(self._refresh_status)
-            rows.addLayout(code_row)
-            layout.addWidget(panel)
+            more_layout.addWidget(self.status_label)
 
             self.setup_notice = QtWidgets.QLabel("")
             self.setup_notice.setWordWrap(True)
-            self.setup_notice.setStyleSheet("color: #e6bc72;")
+            self.setup_notice.setStyleSheet("color: %s;" % PALETTE["warning"])
             self.setup_notice.hide()
-            layout.addWidget(self.setup_notice)
+            more_layout.addWidget(self.setup_notice)
 
             footer = QtWidgets.QHBoxLayout()
             self.ai_access_button = QtWidgets.QPushButton("AI 接入")
@@ -177,7 +243,7 @@ if QtWidgets is not None:
             self.details_button = QtWidgets.QPushButton("详细信息")
             self.details_button.setCheckable(True)
             footer.addWidget(self.details_button)
-            layout.addLayout(footer)
+            more_layout.addLayout(footer)
 
             details = QtWidgets.QHBoxLayout()
             self.refresh_button = QtWidgets.QPushButton("刷新")
@@ -188,8 +254,7 @@ if QtWidgets is not None:
             details.addStretch(1)
             self.details_controls = QtWidgets.QWidget()
             self.details_controls.setLayout(details)
-            self.details_controls.hide()
-            layout.addWidget(self.details_controls)
+            more_layout.addWidget(self.details_controls)
 
             self.tabs = QtWidgets.QTabWidget()
             self.overview_text = self._read_only_text()
@@ -214,10 +279,10 @@ if QtWidgets is not None:
             self.tabs.addTab(self.commands_table, "Commands")
             self.tabs.addTab(self.rpc_log_table, "RPC Log")
             self.tabs.addTab(self.raw_text, "Raw")
-            layout.addWidget(self.tabs, 1)
-            self.tabs.hide()
+            more_layout.addWidget(self.tabs, 1)
 
-            self.details_button.toggled.connect(self._toggle_details)
+            self.more_button.toggled.connect(self._update_expansion)
+            self.details_button.toggled.connect(self._update_expansion)
             self.refresh_button.clicked.connect(self.refresh)
             self.server_button.clicked.connect(self._toggle_bridge)
             self.read_only.toggled.connect(self._set_read_only)
@@ -227,13 +292,21 @@ if QtWidgets is not None:
             self._status_timer.timeout.connect(self._refresh_status)
             self._status_timer.start()
 
-        def _toggle_details(self, expanded: bool) -> None:
-            self.tabs.setVisible(expanded)
-            self.details_controls.setVisible(expanded)
-            self.details_button.setText("隐藏详情" if expanded else "详细信息")
-            self.resize(900 if expanded else 570, 680 if expanded else 255)
-            if expanded:
+        def _update_expansion(self) -> None:
+            expanded = self.more_button.isChecked()
+            detailed = expanded and self.details_button.isChecked()
+            self.more_button.setText("收起" if expanded else "更多")
+            self.tabs.setVisible(detailed)
+            self.details_controls.setVisible(detailed)
+            self.details_button.setText("隐藏详情" if self.details_button.isChecked() else "详细信息")
+            self.more_content.setVisible(expanded)
+            if detailed:
                 self.refresh()
+            self.layout().activate()
+            if detailed:
+                self.resize(880, 640)
+            else:
+                self.resize(560 if expanded else 384, self.sizeHint().height())
 
         def _capture_preview(self, arguments) -> None:
             self.preview_button.setEnabled(False)
@@ -285,13 +358,13 @@ if QtWidgets is not None:
             layout.addWidget(client)
             instances = QtWidgets.QComboBox()
             instances.setAccessibleName("目标 Houdini")
-            instances.addItem("所有实例 · 按控制代码匹配", None)
+            instances.addItem("所有实例 · 按端口匹配", None)
             current = server.status().get("session_id")
             server_names = {None: codex_setup.SERVER_NAME}
             for record in auth.discover_sessions():
                 item = auth.public_session(record)
                 hip = Path(item.get("hip_name") or "未命名 HIP").name
-                label = f"Houdini {item.get('houdini_version', '')} · {hip} · PID {item.get('pid', '-')}"
+                label = f"Houdini {item.get('houdini_version', '')} · {hip} · 端口 {item['port']}"
                 instance_id = item["session_id"]
                 if instance_id == current:
                     label += "（当前）"
@@ -481,12 +554,20 @@ if QtWidgets is not None:
         def _refresh_status(self) -> None:
             self._update_status({"server": server.status(), "health": commands.health()})
 
-        def set_setup_notice(self, message: str) -> None:
-            self.setup_notice.setText(str(message))
-            self.setup_notice.setVisible(bool(message))
+        def set_setup_notice(self, message: str, *, connection=False) -> None:
+            label = self.connection_notice if connection else self.setup_notice
+            label.setText(str(message))
+            label.setVisible(bool(message))
+            if connection:
+                QtCore.QTimer.singleShot(0, self._fit_connection_notice)
+
+        def _fit_connection_notice(self) -> None:
+            if not self.tabs.isVisible():
+                self.layout().activate()
+                self.resize(self.width(), self.sizeHint().height())
 
         def refresh(self) -> None:
-            if not self.details_button.isChecked():
+            if not (self.more_button.isChecked() and self.details_button.isChecked()):
                 self._refresh_status()
                 return
             snapshot = build_snapshot()
@@ -500,58 +581,68 @@ if QtWidgets is not None:
             self._show_selected_node_details()
 
         def _toggle_bridge(self) -> None:
-            if server.status().get("running"):
-                try:
+            self.set_setup_notice("", connection=True)
+            was_running = server.status().get("running")
+            if self.port_edit.isModified():
+                if not self._apply_port() or was_running:
+                    return
+            try:
+                if was_running:
                     server.stop_server()
-                except Exception as exc:
-                    self.set_setup_notice(str(exc))
-                    return
-            else:
-                try:
+                else:
                     server.start_server()
-                except (OSError, ValueError) as exc:
-                    self._show_code_error(exc)
-                    return
+            except Exception as exc:
+                self.show_connection_error(exc)
+                return
+            if not was_running:
                 from . import shelf
                 setup = shelf._ensure_codex_setup()
                 if setup.get("changed") or not setup.get("ok"):
                     self.set_setup_notice(shelf._codex_message(setup))
             self.refresh()
 
-        def _show_code_error(self, error) -> None:
-            self.set_setup_notice({
-                "control_code_in_use": "此控制代码已被另一个 Houdini 使用，请换一个代码。",
-            }.get(str(error), f"Bridge 设置失败 · {error}"))
+        def show_connection_error(self, error) -> None:
+            if getattr(error, "winerror", None) == 10048 or getattr(error, "errno", None) == errno.EADDRINUSE:
+                message = "端口已被占用，请输入其他端口。"
+            else:
+                message = f"Bridge 设置失败 · {error}"
+            self.set_setup_notice(message, connection=True)
 
-        def _save_control_code(self) -> None:
-            try:
-                code = server.set_control_code(self.control_code.text())
-            except ValueError as exc:
-                if str(exc) == "control_code_in_use":
-                    self._show_code_error(exc)
-                else:
-                    self.set_setup_notice(self.control_code.toolTip())
-                return
-            except (OSError, RuntimeError) as exc:
-                self._show_code_error(exc)
-                return
-            self.control_code.setText(code)
-            self.control_code.setModified(False)
-            self.set_setup_notice("")
+        def _port_edited(self) -> None:
+            if not self.connection_notice.isHidden():
+                self.set_setup_notice("", connection=True)
             self._refresh_status()
 
-        def _copy_control_code(self) -> None:
+        def _apply_port(self) -> bool:
+            try:
+                port = auth.normalize_port(int(self.port_edit.text()))
+            except ValueError:
+                self.set_setup_notice("请输入 1–65535 的整数端口。", connection=True)
+                return False
+            try:
+                server.set_port(port)
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.port_edit.setModified(False)
+                self._refresh_status()
+                self.show_connection_error(exc)
+                return False
+            self.port_edit.setModified(False)
+            self.set_setup_notice("", connection=True)
+            self.refresh()
+            return True
+
+        def _copy_connection(self) -> None:
             info = server.status()
-            if not info["running"] or self.control_code.isModified():
+            if not info["running"] or self.port_edit.isModified():
                 return
-            code = info["control_code"]
+            port = info["port"]
             hip = Path(info.get("hip_name") or "未命名 HIP").name
             QtWidgets.QApplication.clipboard().setText(
-                f"使用 Houdini 控制代码 {code}（窗口中的 HIP 为 {hip}）。"
-                f"先调用 houdini_context 并传入 control_code={code} 核对 HIP。"
-                "后续操作沿用这个 control_code，并把查到的 session_id 作为 target_instance。")
-            self.copy_code_button.setText("已复制")
-            QtCore.QTimer.singleShot(1500, lambda: self.copy_code_button.setText("复制给 AI"))
+                f"连接 Houdini Bridge {info['host']}:{port}（窗口中的 HIP 为 {hip}）。"
+                f"先调用 houdini_context 并传入 port={port} 核对 HIP。"
+                "后续操作沿用这个 port，并把查到的 session_id 作为 target_instance。")
+            button = self.copy_connection_button
+            QtWidgets.QToolTip.showText(button.mapToGlobal(button.rect().bottomLeft()), "已复制连接信息", button)
 
         def _set_read_only(self, enabled: bool) -> None:
             state.set_read_only(enabled)
@@ -562,24 +653,35 @@ if QtWidgets is not None:
             is_running = bool(info.get("running"))
             editable = is_running and state.edit_enabled()
             hip = Path(info.get("hip_name") or "未命名 HIP").name
-            main_status = (info.get("main_thread") or {}).get("status")
-            suffix = " · 主线程忙碌" if main_status == "busy_or_unresponsive" else ""
-            self.status_label.setText(f"{hip}{suffix}" if is_running else "本地服务未运行")
-            mode = "可编辑" if editable else "只读"
-            self._set_state_label(self.server_state, is_running, f"服务运行中 · {mode}", "已停止")
-            self.server_button.setText("停止" if is_running else "启动")
+            self.status_label.setText(hip)
+            self.status_label.setVisible(is_running)
+            busy = (info.get("main_thread") or {}).get("status") == "busy_or_unresponsive"
+            pending = self.port_edit.isModified()
+            if pending:
+                status, mark, color = "待应用", "—", "warning"
+            elif is_running and busy:
+                status, mark, color = "主线程忙碌", "!", "warning"
+            elif is_running:
+                status, mark, color = "运行中", "✓", "success"
+            else:
+                status, mark, color = "已停止", "—", "text_muted"
+            self.server_state.setText(f"{status} · {info.get('host', server.HOST)}:")
+            self.server_mark.setText(mark)
+            self.server_mark.setStyleSheet("font-weight: 600; color: %s;" % PALETTE[color])
+            if not pending:
+                self.port_edit.setText(str(info.get("port") or ""))
+            if is_running:
+                self.server_button.setText("应用端口" if pending else "停止 Bridge")
+            else:
+                self.server_button.setText("启动 Bridge")
             previous = self.read_only.blockSignals(True)
             self.read_only.setChecked(is_running and not editable)
             self.read_only.blockSignals(previous)
             self.read_only.setEnabled(is_running)
-            if not self.control_code.isModified():
-                self.control_code.setText(info.get("control_code", ""))
-            self.save_code_button.setEnabled(self.control_code.isModified())
-            self.copy_code_button.setEnabled(is_running and not self.control_code.isModified())
-
-        def _set_state_label(self, label, enabled, on_text, off_text):
-            label.setText(on_text if enabled else off_text)
-            label.setStyleSheet("font-weight: 600; color: %s;" % ("#78d6a2" if enabled else "#aeb9c7"))
+            self.read_only.setToolTip(
+                "只读时，场景修改和 Python 执行都会暂停接收。"
+                if is_running else "启动 Bridge 后可切换只读。")
+            self.copy_connection_button.setEnabled(is_running and not pending)
 
         def _fill_network(self, network: dict[str, Any]) -> None:
             nodes = network.get("nodes") or []

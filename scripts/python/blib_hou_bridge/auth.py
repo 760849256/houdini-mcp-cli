@@ -35,6 +35,12 @@ def generate_token() -> str:
 _CONTROL_CODE_CHARS = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 
 
+def normalize_port(value: int) -> int:
+    if type(value) is not int or not 1 <= value <= 65535:
+        raise ValueError("Bridge port must be an integer from 1 to 65535.")
+    return value
+
+
 def generate_control_code() -> str:
     return "".join(secrets.choice(_CONTROL_CODE_CHARS) for _ in range(8))
 

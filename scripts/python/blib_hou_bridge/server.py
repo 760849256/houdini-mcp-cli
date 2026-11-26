@@ -16,6 +16,7 @@ HOST = "127.0.0.1"
 DEFAULT_PORT = 0
 MAX_BODY_BYTES = 1024 * 1024
 _server: "BridgeServer | None" = None
+_preferred_port = globals().get("_preferred_port", DEFAULT_PORT)
 _control_code = globals().get("_control_code") or auth.generate_control_code()
 
 
@@ -24,6 +25,8 @@ class InstanceMismatch(RuntimeError):
 
 
 class LocalHTTPServer(ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR can let two sockets bind the same endpoint.
+    allow_reuse_address = os.name != "nt"
     daemon_threads = True
     block_on_close = False
 
@@ -82,6 +85,7 @@ class BridgeServer:
         self.tasks = None
         self._task_timer = None
         self._host_ui = False
+        self._shutdown_watch = None
         self._blocked_reason = None
 
     @property
@@ -120,6 +124,9 @@ class BridgeServer:
         self._last_tick = time.monotonic()
         try:
             import hou
+            is_shutting_down = getattr(hou.hipFile, "isShuttingDown", None)
+            if is_shutting_down is not None and is_shutting_down():
+                return
             self._hip_name = hou.hipFile.basename()
             context = commands.context(hou)
             self._houdini_version = context["application"]["version"]
@@ -185,15 +192,24 @@ class BridgeServer:
         self._event("service_started")
         return self.info()
 
-    def stop(self):
+    def stop(self, *, host_exiting=False):
         if self._stopping.is_set():
             return
-        if any(job["status"] == "running" for job in python_executor.active()):
+        if not host_exiting and any(job["status"] == "running" for job in python_executor.active()):
             raise tasks.TaskError("task_running", "A legacy Python job is running; wait for it before reload.")
         if self.tasks is not None:
-            self.tasks.stop()
+            self.tasks.stop(host_exiting=host_exiting)
         self._stopping.set()
         self._lease_stop.set()
+        if self._shutdown_watch is not None:
+            window, watcher = self._shutdown_watch
+            self._shutdown_watch = None
+            window.removeEventFilter(watcher)
+            watcher.deleteLater()
+        try:
+            state.release_scene_events()
+        except Exception:
+            self._event("shutdown_error", reason="hip_callback_remove_failed")
         if self._task_timer is not None:
             self._task_timer.stop()
             self._task_timer.deleteLater()
@@ -213,7 +229,10 @@ class BridgeServer:
                     auth.retire_session(self.session_path, self.generation)
             except OSError:
                 self._event("registry_error", reason="retire_write_failed")
-        self._event("service_stopped")
+        if host_exiting:
+            self._event("service_stopped", reason="houdini_shutdown")
+        else:
+            self._event("service_stopped")
 
     def info(self):
         return {"running": bool(self.thread and self.thread.is_alive() and not self._stopping.is_set()),
@@ -264,12 +283,35 @@ class BridgeServer:
             self._task_timer.setInterval(20)
             self._task_timer.timeout.connect(self._drain_tasks)
             self._task_timer.start()
+            self._watch_host_shutdown(hou, QtCore)
         self.tasks.start(background_consumer=not self._host_ui)
+
+    def _watch_host_shutdown(self, hou, QtCore):
+        window = hou.qt.mainWindow()
+        if window is None:
+            return
+        service = self
+
+        class ShutdownWatch(QtCore.QObject):
+            def eventFilter(self, watched, event):
+                # Both supported Houdini versions hide this window after the
+                # save prompt is resolved. BeforeQuit is too early for cleanup.
+                if event.type() == QtCore.QEvent.Hide and hou.hipFile.isShuttingDown():
+                    service.stop(host_exiting=True)
+                return False
+
+        watcher = ShutdownWatch(window)
+        window.installEventFilter(watcher)
+        self._shutdown_watch = (window, watcher)
 
     def _drain_tasks(self):
         try:
-            if not self.tasks._queue:
+            if self._stopping.is_set() or not self.tasks._queue:
                 self._blocked_reason = None
+                return
+            import hou
+            if hou.hipFile.isShuttingDown():
+                self._blocked_reason = "hip_unloading"
                 return
             try:
                 from PySide6 import QtWidgets
@@ -542,11 +584,8 @@ class BridgeServer:
         return Handler
 
 
-def start_server(port=DEFAULT_PORT, *, read_only=False):
-    global _server
-    if _server is not None and _server.info()["running"]:
-        return _server.info()
-    service = BridgeServer(port=port, control_code=_control_code)
+def _start_service(service, read_only):
+    global _server, _preferred_port
     state.set_read_only(read_only)
     try:
         result = service.start()
@@ -554,7 +593,46 @@ def start_server(port=DEFAULT_PORT, *, read_only=False):
         state.set_read_only(True)
         raise
     _server = service
+    _preferred_port = result["port"]
     return result
+
+
+def start_server(port=None, *, read_only=False):
+    if _server is not None and _server.info()["running"]:
+        return _server.info()
+    return _start_service(BridgeServer(port=_preferred_port if port is None else port,
+                                       control_code=_control_code), read_only)
+
+
+def set_port(port):
+    """Change this process's endpoint, keeping the old listener on a bind conflict."""
+    global _server, _preferred_port
+    port = auth.normalize_port(port)
+    previous = status()
+    if not previous["running"]:
+        _preferred_port = port
+        return status()
+    if port == previous["port"]:
+        return previous
+
+    # Reserve the new port before stopping the old service or touching its tasks.
+    replacement = BridgeServer(port=port, control_code=_control_code)
+    try:
+        _server.stop()
+    except Exception:
+        replacement.httpd.server_close()
+        raise
+
+    _server = None
+    read_only = previous["mode"] == "read"
+    try:
+        return _start_service(replacement, read_only)
+    except Exception as change_error:
+        try:
+            _start_service(BridgeServer(port=previous["port"], control_code=_control_code), read_only)
+        except Exception as restore_error:
+            raise RuntimeError(f"Port change failed ({change_error}); previous port could not be restored ({restore_error}).") from restore_error
+        raise
 
 
 def stop_server():
@@ -586,8 +664,8 @@ def set_control_code(value):
 
 def status():
     if _server is None:
-        return {"running": False, "host": HOST, "mode": "read", "control_code": _control_code,
-                "version": protocol.BRIDGE_VERSION, "session_path": str(auth.default_session_path())}
+        return {"running": False, "host": HOST, "port": _preferred_port, "mode": "read",
+                "control_code": _control_code, "version": protocol.BRIDGE_VERSION, "session_path": str(auth.default_session_path())}
     return _server.info()
 
 

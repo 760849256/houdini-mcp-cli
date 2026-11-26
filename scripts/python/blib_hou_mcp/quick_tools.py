@@ -269,6 +269,8 @@ def _context(adapter, arguments):
         ctx = response["result"]
         if adapter._connection.bound_instance:
             ctx["session_id"] = adapter._connection.bound_instance
+        if adapter._connection.port is not None:
+            ctx["port"] = adapter._connection.port
         if adapter._connection.control_code is not None:
             ctx["control_code"] = adapter._connection.control_code
         if not arguments.get("fields"):

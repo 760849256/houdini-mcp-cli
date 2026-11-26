@@ -121,6 +121,31 @@ class TaskLifecycleTests(unittest.TestCase):
         self.assertEqual(final["status"], "succeeded")
         self.assertTrue(final["execution_started"])
 
+    def test_host_exit_fences_queued_tasks_and_preserves_running_effects(self):
+        def perform(command, payload, context):
+            context.start_effects()
+            with self.assertRaises(tasks.TaskError) as caught:
+                manager.stop()
+            self.assertEqual(caught.exception.code, "task_running")
+            manager.stop(host_exiting=True)
+            running = manager.wait(context.job_id, wait_ms=3000)
+            self.assertEqual(running["status"], "running")
+            self.assertTrue(running["cancel_requested"])
+            context.checkpoint()
+
+        manager = self.manager(perform)
+        active, queued = self.submit(manager), self.submit(manager)
+        manager.drain_one()
+
+        final = manager.get(active["job_id"])
+        self.assertEqual(final["status"], "partial")
+        self.assertTrue(final["execution_started"])
+        unused = manager.get(queued["job_id"])
+        self.assertEqual(unused["status"], "cancelled")
+        self.assertFalse(unused["execution_started"])
+        with self.assertRaises(tasks.TaskError):
+            self.submit(manager)
+
     def test_cooperative_cancel_reports_already_applied_effects(self):
         entered, release = threading.Event(), threading.Event()
         def perform(command, payload, context):

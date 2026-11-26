@@ -33,8 +33,8 @@ class ConnectionRecoveryTests(unittest.TestCase):
         self.environment.stop()
         self.temp.cleanup()
 
-    def service(self, identity=None):
-        service = server.BridgeServer()
+    def service(self, identity=None, port=0):
+        service = server.BridgeServer(port=port)
         service.session_id = identity or str(uuid.uuid4())
         service.start()
         self.services.append(service)
@@ -370,6 +370,59 @@ class ConnectionRecoveryTests(unittest.TestCase):
         self.assertTrue(auth.refresh_session(second.session_path, second.generation, {"control_code": code}))
         stale = adapter.call_tool("houdini_execute", args)
         self.assertEqual(stale["structuredContent"]["error"]["code"], "control_code_changed")
+
+    def test_port_routes_are_isolated_and_reject_reuse_by_another_session(self):
+        first, second = self.service(), self.service()
+        adapter = BridgeMCPAdapter(tool_profile="daily")
+        with patch.object(commands, "execute_in_houdini", return_value={"selection": []}):
+            for service in (first, second):
+                reply = adapter.call_tool("houdini_context", {"port": service.port})
+                self.assertFalse(reply["isError"], reply)
+                identity = reply["structuredContent"]["result"]
+                self.assertEqual(identity["session_id"], service.session_id)
+                self.assertEqual(identity["port"], service.port)
+        direct = Connection(port=second.port)
+        self.assertTrue(direct.call("health", {})["ok"])
+        self.assertEqual(direct.bound_instance, second.session_id)
+        write = {"port": first.port, "code": "raise AssertionError()"}
+        unsafe = adapter.call_tool("houdini_execute", write)
+        self.assertEqual(unsafe["structuredContent"]["error"]["code"], "target_instance_required")
+        write["target_instance"] = first.session_id
+        first.stop()
+        missing = adapter.call_tool("houdini_execute", write)
+        self.assertEqual(missing["structuredContent"]["error"]["code"], "port_offline")
+        replacement = self.service(port=first.port)
+        self.assertNotEqual(replacement.session_id, first.session_id)
+        stale = adapter.call_tool("houdini_execute", write)
+        self.assertEqual(stale["structuredContent"]["error"]["code"], "port_changed")
+
+    def test_explicit_port_edit_preserves_old_listener_on_conflict_and_keeps_read_only(self):
+        occupied = self.service()
+        candidate = server.BridgeServer()
+        requested_port = candidate.port
+        candidate.httpd.server_close()
+        with patch.object(server, "_server", None), patch.object(server, "_preferred_port", 0):
+            try:
+                original = server.start_server(read_only=True)
+                client = Connection(instance=original["session_id"], port=original["port"])
+                self.assertTrue(client.call("health", {})["ok"])
+                with self.assertRaises(OSError):
+                    server.set_port(occupied.port)
+                self.assertEqual(server.status()["port"], original["port"])
+                self.assertEqual(server.status()["generation"], original["generation"])
+                self.assertTrue(client.call("health", {})["ok"])
+                changed = server.set_port(requested_port)
+                self.assertEqual(changed["port"], requested_port)
+                self.assertEqual(changed["session_id"], original["session_id"])
+                self.assertNotEqual(changed["generation"], original["generation"])
+                self.assertEqual(changed["mode"], "read")
+                self.assertFalse(client.call("health", {})["ok"])
+                new_client = Connection(instance=changed["session_id"], port=requested_port)
+                self.assertTrue(new_client.call("health", {})["ok"])
+                server.stop_server()
+                self.assertEqual(server.start_server()["port"], requested_port)
+            finally:
+                server.stop_server()
 
     def test_context_can_explicitly_bind_without_editing_client_configuration(self):
         first, second = self.service(), self.service()

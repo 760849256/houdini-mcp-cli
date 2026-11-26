@@ -426,7 +426,7 @@ class TaskManager:
         deadline = time.monotonic() + max(0, min(wait_ms, 3000)) / 1000
         while True:
             record = self.get(job_id)
-            if record["status"] in TERMINAL or time.monotonic() >= deadline:
+            if record["status"] in TERMINAL or self._closed.is_set() or time.monotonic() >= deadline:
                 return record
             time.sleep(0.02)
 
@@ -452,13 +452,21 @@ class TaskManager:
             self._worker = threading.Thread(target=consume, name="BlibTaskConsumer", daemon=True)
             self._worker.start()
 
-    def stop(self):
+    def stop(self, *, host_exiting=False):
         with self._lock:
-            if self._running is not None:
+            if self._running is not None and not host_exiting:
                 raise TaskError("task_running", "A host task is running. Stop/reload is deferred; cancel cooperatively or wait for it.")
             self._accepting = False
-            for job_id in list(self._queue):
-                self.cancel(job_id)
+            pending = list(self._queue)
+            if self._running is not None:
+                pending.append(self._running)
+            try:
+                for job_id in pending:
+                    self.cancel(job_id)
+            except (sqlite3.Error, OSError):
+                self.storage_error = True
+                if not host_exiting:
+                    raise
             self._closed.set()
             self._wake.set()
         for worker in (self._worker, self._expiry_worker):

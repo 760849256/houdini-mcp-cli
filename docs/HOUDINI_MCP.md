@@ -154,25 +154,24 @@ Reload itself. Mock restoration checks do not establish visual capture quality.
 
 ## Multiple Houdini instances
 
-Register the standard Blib Houdini Bridge MCP once. In each Houdini window,
-open **Bridge → 控制代码**. Each process starts with a random eight-character
-code. You can rename it, for example to GROOM-A or CACHE-B, and press **保存**.
-Codes are case-insensitive and unique across running Bridges.
+Register the standard Blib Houdini Bridge MCP once. Each Houdini process initially
+chooses a free local port. Edit the digits after `127.0.0.1:` in **Bridge** and
+press Enter or click **应用端口**. An occupied port leaves the current listener
+in place. Stop/start in the same Houdini process keeps the chosen port.
 
-Press **复制给 AI** in each Houdini and paste into the corresponding AI chat.
-The AI calls houdini_context with control_code to confirm the HIP, then sends
-that code and the returned session_id as target_instance on subsequent calls.
-Calls share the same MCP entry and route independently. An unavailable code
-or mismatched instance rejects the request before sending it to a Houdini.
-Bridge stop/start in the same process keeps its code. A new Houdini process
-starts with a new random code.
+Click the **copy icon beside the port** in the intended Houdini window. The AI calls
+`houdini_context` with the numeric `port` to confirm the HIP, then passes
+the same `port` and the returned `session_id` as `target_instance` on
+subsequent calls. Calls share one MCP entry. If a different process takes the
+same port, requests with the old instance ID are rejected. Existing integrations
+that already use `control_code` can still send it.
 
 For a fixed MCP entry, **AI 接入** also offers an explicit Houdini process
 selection. The resulting --instance configuration only accepts that process.
 
 ## MCP Config
 
-Open **Bridge → AI 接入** to see the local Codex registration status and copy
+Open **Bridge → 更多 → AI 接入** to see the local Codex registration status and copy
 a config for Codex, Antigravity or another stdio MCP client. Select a Houdini
 instance to bind the exported config. **测试连接** launches the adapter and
 checks the MCP handshake and live host state. In Antigravity IDE,

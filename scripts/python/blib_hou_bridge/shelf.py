@@ -64,7 +64,7 @@ def set_python_mode(enabled: bool = True) -> bool:
 
 def show_inspector():
     setup = None
-    code_conflict = False
+    start_error = None
     if not server.status().get("running"):
         importlib.reload(protocol)
         importlib.reload(auth)
@@ -75,10 +75,8 @@ def show_inspector():
         importlib.reload(server)
         try:
             server.start_server()
-        except ValueError as exc:
-            if str(exc) != "control_code_in_use":
-                raise
-            code_conflict = True
+        except (OSError, RuntimeError, ValueError) as exc:
+            start_error = exc
         else:
             setup = _ensure_codex_setup()
     # Keep the existing window alive when the shelf button is clicked again.
@@ -86,8 +84,8 @@ def show_inspector():
     if window is None or not inspector._is_alive(window):
         importlib.reload(inspector)
     window = inspector.show()
-    if code_conflict:
-        window.set_setup_notice("此控制代码已被另一个 Houdini 使用。请保存新代码，再启动 Bridge。")
+    if start_error is not None:
+        window.show_connection_error(start_error)
     elif setup and (setup.get("changed") or not setup.get("ok")):
         window.set_setup_notice(_codex_message(setup))
     return window

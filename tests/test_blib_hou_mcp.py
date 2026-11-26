@@ -138,6 +138,10 @@ class BridgeMCPAdapterTests(unittest.TestCase):
             schema = json.loads(json.dumps(
                 next(tool for tool in tools if tool["name"] == f"houdini_{command}")["inputSchema"]))
             properties = schema["properties"]
+            route_port = properties.pop("port")
+            self.assertEqual(route_port["type"], "integer")
+            self.assertEqual(route_port["minimum"], 1)
+            self.assertEqual(route_port["maximum"], 65535)
             for key in ("control_code", "target_instance"):
                 self.assertEqual(properties.pop(key)["type"], "string")
             if command == "context":

@@ -8,7 +8,7 @@ import uuid
 _access_lock = threading.RLock()
 _access = (False, False, uuid.uuid4().hex)
 _scene_epoch = uuid.uuid4().hex
-_scene_event_owner = None
+_scene_event_registration = globals().get("_scene_event_registration")
 _scene_event_types = ()
 
 
@@ -34,11 +34,13 @@ def _scene_event(event_type, **kwargs):
 
 
 def ensure_scene_events(hou):
-    global _scene_event_owner, _scene_event_types
+    global _scene_event_registration, _scene_event_types
     hip = hou.hipFile
     callbacks = getattr(hip, "eventCallbacks", None)
-    if _scene_event_owner is hip and (callbacks is None or _scene_event in callbacks()):
+    registration = _scene_event_registration
+    if registration and registration[0] is hip and (callbacks is None or registration[1] in callbacks()):
         return
+    release_scene_events()
     enumeration = getattr(hou, "hipFileEventType", None)
     _scene_event_types = tuple(getattr(enumeration, name) for name in (
         "BeforeLoad", "AfterLoad", "BeforeClear", "AfterClear", "BeforeMerge", "AfterMerge")
@@ -46,7 +48,19 @@ def ensure_scene_events(hou):
     callback = getattr(hip, "addEventCallback", None)
     if callback is not None:
         callback(_scene_event)
-        _scene_event_owner = hip
+        _scene_event_registration = (hip, _scene_event)
+
+
+def release_scene_events():
+    global _scene_event_registration
+    if _scene_event_registration is None:
+        return
+    hip, callback = _scene_event_registration
+    remove = getattr(hip, "removeEventCallback", None)
+    callbacks = getattr(hip, "eventCallbacks", None)
+    if remove is not None and (callbacks is None or callback in callbacks()):
+        remove(callback)
+    _scene_event_registration = None
 
 
 def _set_access(edit: bool, python: bool) -> None:

@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import queue
+import socket
 import statistics
 import subprocess
 import sys
@@ -50,26 +51,30 @@ def control():
     command = request["command"]
     command_path.unlink()
     if command == "control_code":
+        try:
+            server.set_control_code(request["code"])
+        except ValueError as error:
+            auth.atomic_json(root / "code_error.json", {"message": str(error)})
+        publish()
+    elif command == "port":
+        from unittest.mock import Mock, patch
         from blib_hou_bridge import inspector
-        code = request["code"]
-        if hou.isUIAvailable():
-            window = inspector.show()
-            window.control_code.clear()
-            window.control_code.insert(code)
-            window._status_timer.timeout.emit()
-            window.save_code_button.click()
-            window.copy_code_button.click()
-            auth.atomic_json(root / "code_ui.json", {
-                "field": window.control_code.text(),
-                "notice": window.setup_notice.text(),
-                "clipboard": QtWidgets.QApplication.clipboard().text(),
-            })
-            window.hide()
-        else:
-            try:
-                server.set_control_code(code)
-            except ValueError as error:
-                auth.atomic_json(root / "code_error.json", {"message": str(error)})
+
+        window = inspector.show()
+        window.port_edit.selectAll()
+        window.port_edit.insert(str(request["port"]))
+        window.server_button.click()
+        assert not window.more_content.isVisible()
+        assert window.copy_connection_button.isVisible()
+        clipboard = Mock()
+        with patch.object(QtWidgets.QApplication, "clipboard", return_value=clipboard):
+            window.copy_connection_button.click()
+        auth.atomic_json(root / "port_ui.json", {
+            "field": window.port_edit.text(),
+            "notice": window.connection_notice.text(),
+            "clipboard": clipboard.setText.call_args.args[0],
+        })
+        window.hide()
         publish()
     elif command == "restart":
         server.stop_server()
@@ -374,9 +379,14 @@ def run(executable, gui, samples, report_path, exercise=None):
                 command(root, "control_code", code="groom-a")
                 wait_for(lambda: json.loads((root / "ready.json").read_text())["control_code"] == "GROOM-A", 8)
                 if gui:
-                    ui = json.loads((root / "code_ui.json").read_text(encoding="utf-8"))
-                    assert ui["field"] == "GROOM-A" and ui["notice"] == ""
-                    assert "control_code=GROOM-A" in ui["clipboard"] and "target_instance" in ui["clipboard"]
+                    with socket.socket() as reservation:
+                        reservation.bind(("127.0.0.1", 0))
+                        new_port = reservation.getsockname()[1]
+                    command(root, "port", port=new_port)
+                    wait_for(lambda: json.loads((root / "ready.json").read_text())["port"] == new_port, 8)
+                    ui = json.loads((root / "port_ui.json").read_text(encoding="utf-8"))
+                    assert ui["field"] == str(new_port) and ui["notice"] == ""
+                    assert f"port={new_port}" in ui["clipboard"] and "target_instance" in ui["clipboard"]
                     report["control_center_edit_and_copy"] = True
                 command(other_root, "control_code", code="groom-a")
                 conflict = other_root / "code_error.json"

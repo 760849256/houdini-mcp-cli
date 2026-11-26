@@ -4166,23 +4166,16 @@ class BlibHouBridgeTests(unittest.TestCase):
         self.assertIn("tools/clean_release_artifacts.py", tool.REQUIRED_PATHS)
         self.assertIn("tools/install_houdini_package.py", tool.REQUIRED_PATHS)
         self.assertIn("tools/write_houdini_package.py", tool.REQUIRED_PATHS)
-        self.assertIn("Codex, MCP clients, CLI scripts", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("connect to Houdini", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("Fast Path: Connect Codex To Houdini", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("Use With Codex Or Similar Tools", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("%UserProfile%\\.codex\\config.toml", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("[mcp_servers.blib-houdini-bridge]", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("codex mcp list", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("python tools\\install_houdini_package.py", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("python tools\\write_houdini_package.py --output Blib_Houdini_Bridge.local.json", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("docs/BRIDGE_ONLY_RELEASE.md", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("python scripts\\cli\\blib_hou.py doctor", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("python scripts\\cli\\blib_hou.py scene-snapshot --path /obj", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("python scripts\\cli\\blib_hou_mcp.py --status", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("python scripts\\cli\\blib_hou_mcp.py --print-codex-config", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("python scripts\\cli\\blib_hou_mcp.py --print-config", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("Safety Model", tool.REQUIRED_DOC_MARKERS["README.md"])
-        self.assertIn("中文说明", tool.REQUIRED_DOC_MARKERS["README.md"])
+        for document, marker in (
+            ("README.md", "python tools/install_houdini_package.py"),
+            ("README.md", "docs/HOUDINI_MCP.md"),
+            ("README.md", "只读"),
+            ("docs/HOUDINI_MCP.md", "--print-codex-add-command"),
+            ("docs/HOUDINI_MCP.md", "--print-client-config antigravity"),
+            ("docs/HOUDINI_MCP.md", "target_instance"),
+            ("docs/BRIDGE_ONLY_RELEASE.md", "write_houdini_package.py --output Blib_Houdini_Bridge.local.json"),
+        ):
+            self.assertIn(marker, tool.REQUIRED_DOC_MARKERS[document])
         self.assertIn("blib_agent", tool.FORBIDDEN_SHELF_IMPORTS)
 
     def test_release_validator_strict_mode_blocks_warnings(self):

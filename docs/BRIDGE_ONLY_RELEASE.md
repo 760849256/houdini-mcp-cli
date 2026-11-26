@@ -72,8 +72,8 @@ python tools\write_houdini_package.py --output Blib_Houdini_Bridge.local.json
    `Blib_Houdini_Bridge.json` is a template; do not install it until
    `BLIB_HOUDINI_BRIDGE` points at the receiver's local release root.
 4. Start Houdini and open the `Blib Bridge` shelf.
-5. Click `Bridge` to start the local server. Keep edit mode off until writes are
-   intentional.
+5. Click `Bridge` to start the local server. Bridge starts editable, including
+   Python. Enable **只读** for inspection and previews.
 
 ## CLI Smoke
 
